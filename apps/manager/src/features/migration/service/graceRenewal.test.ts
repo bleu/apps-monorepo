@@ -20,9 +20,9 @@ import {
 } from 'viem'
 import { labelhash, namehash } from 'viem/ens'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Connector } from 'wagmi'
 import { createActor, fromPromise } from 'xstate'
 import { chain } from '@/config'
+import { SAFE_WALLET_CONNECTOR } from '@/test-utils/safeWallet.fixture'
 import { V1_CONTRACTS } from '../contracts/addresses'
 import { migrationUiMachine } from '../state/migrationUi.machine'
 import { classifyNames } from './classifyNames'
@@ -53,17 +53,6 @@ const OWNER = '0x1111111111111111111111111111111111111111' as const
 const OTHER = '0x2222222222222222222222222222222222222222' as const
 const APPROVAL_HASH = `0x${'a'.repeat(64)}` as Hex
 const RENEWAL_HASH = `0x${'b'.repeat(64)}` as Hex
-// checkIsSafeWallet reads only `type` and the WalletConnect session's peer.
-const SAFE_CONNECTOR = {
-  type: 'walletConnect',
-  getProvider: async () => ({
-    session: {
-      peer: {
-        metadata: { name: 'Safe{Wallet}', url: 'https://app.safe.global' },
-      },
-    },
-  }),
-} as unknown as Connector
 const DAY = 86_400n
 const NOW = 2_000_000_000n
 
@@ -815,7 +804,7 @@ describe('bulk grace renewal', () => {
       quote,
       publicClient: s.publicClient,
       walletClient: s.walletClient,
-      connector: SAFE_CONNECTOR,
+      connector: SAFE_WALLET_CONNECTOR,
     })
     return { quote, result }
   }
@@ -850,7 +839,7 @@ describe('bulk grace renewal', () => {
       quote,
       publicClient: s.publicClient,
       walletClient: s.walletClient,
-      connector: SAFE_CONNECTOR,
+      connector: SAFE_WALLET_CONNECTOR,
     })
 
     expect(result.isOk()).toBe(true)
