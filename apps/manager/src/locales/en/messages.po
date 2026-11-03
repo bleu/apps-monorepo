@@ -1588,6 +1588,12 @@ msgstr "Go to slide {0}"
 msgid "Grace period"
 msgstr "Grace period"
 
+#: src/features/dashboard/components/NameRow.tsx
+#: src/features/dashboard/components/PrimaryNameCard.tsx
+#: src/features/profile/components/view/ProfileDetails.tsx
+msgid "Grace period ends"
+msgstr "Grace period ends"
+
 #: src/features/weave-registration/lib/weaveSteps.ts
 msgid "Growing your corner of the decentralized web"
 msgstr "Growing your corner of the decentralized web"
@@ -3288,10 +3294,6 @@ msgstr "Subtotal:"
 #: src/features/navigation/Header/navigation/NavigationContent.tsx
 msgid "Support"
 msgstr "Support"
-
-#: src/features/dashboard/components/FaqSection.tsx
-#~ msgid "Supported direct subnames, such as alice.example.eth, can be included when you upgrade an unwrapped or unlocked example.eth. Each keeps the owner and resolver shown in your review. Existing subname records stay on that resolver, and you keep control of the parent name."
-#~ msgstr "Supported direct subnames, such as alice.example.eth, can be included when you upgrade an unwrapped or unlocked example.eth. Each keeps the owner and resolver shown in your review. Existing subname records stay on that resolver, and you keep control of the parent name."
 
 #: src/features/dashboard/components/FaqSection.tsx
 msgid "Supported direct subnames, such as alice.example.eth, upgrade with an unwrapped or unlocked example.eth:"
