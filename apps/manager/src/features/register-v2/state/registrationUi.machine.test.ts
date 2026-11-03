@@ -1664,6 +1664,7 @@ describe('paying with ETH', () => {
       hash: `0x${'de'.repeat(32)}` as const,
       orderId: 'cow-order-id',
       validTo: 1_800_000_000,
+      kind: 'native' as const,
     }
     savePendingEthSwap(11155111, EOA_ADDRESS, swap)
     const actor = startActorInTokens()
@@ -1673,7 +1674,7 @@ describe('paying with ETH', () => {
     actor.stop()
   })
 
-  it('refuses to pay with ETH without an ENS account', () => {
+  it('allows CoW funding on the EOA registration path', () => {
     const actor = startActorInTokens()
     actor.send({
       // Partial: an EOA account is refused before any wallet field is read.
@@ -1686,8 +1687,8 @@ describe('paying with ETH', () => {
       ethFunding: {},
     })
 
-    expect(actor.getSnapshot().matches('failure')).toBe(true)
-    expect(getChild(actor).getSnapshot().matches('idle')).toBe(true)
+    expect(actor.getSnapshot().matches('failure')).toBe(false)
+    expect(getChild(actor).getSnapshot().matches('idle')).toBe(false)
     actor.stop()
   })
 
