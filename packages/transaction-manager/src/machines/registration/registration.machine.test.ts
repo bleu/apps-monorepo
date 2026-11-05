@@ -973,6 +973,23 @@ describe('registrationMachine — pure-EOA resolver reuse', () => {
     })
   })
 
+  it('prepares the registrar permit for USDC delivered by CoW', async () => {
+    const signFundingPermit = vi.fn(async () => permit)
+    const { actor } = startEoaRegistration({
+      ethFunding: { displayedCharge: 10n ** 16n },
+      readPaymentAuthorization: vi.fn(async () => ({
+        allowance: 0n,
+        livePrice: 5_000_000n,
+      })),
+      signFundingPermit,
+    })
+
+    await waitFor(actor, () => signFundingPermit.mock.calls.length > 0)
+    expect(signFundingPermit.mock.calls[0][0].input).toMatchObject({
+      fundingSource: 'cow-settlement',
+    })
+  })
+
   it('falls back to the normal commit transaction when the CoW hook misses', async () => {
     const validateCommitment = vi.fn(async () => {
       throw new Error('commit hook missing')

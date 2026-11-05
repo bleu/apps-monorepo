@@ -657,6 +657,7 @@ export const registrationMachine = setup({
         publicClient: PublicClient
         chainId: number
         bounds?: PermitValueBounds
+        fundingSource?: 'cow-settlement'
       }) => {
         return signFundingPermitActor(input)
       },
@@ -1709,6 +1710,7 @@ export const registrationMachine = setup({
           // decays). Keep registrar consent exact; sell-token slippage is
           // bounded separately by the CoW order's maximumSell.
           value: context.tokenPrice,
+          fundingSource: 'cow-settlement' as const,
           // biome-ignore lint/style/noNonNullAssertion: guaranteed by flow
           approvalSigner: context.approvalSigner ?? context.signer!,
           // biome-ignore lint/style/noNonNullAssertion: guaranteed by flow
