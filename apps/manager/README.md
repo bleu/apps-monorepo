@@ -50,9 +50,7 @@ are debug-only and must never reach a production deploy:
 select mainnet. See [app environment configuration](../../README.md#app-environments)
 for env-file layering, local overrides and deployment behavior.
 
-On Sepolia every flow pays in Circle's testnet USDC
-([faucet.circle.com](https://faucet.circle.com)); the auto-fund faucet only runs
-against the local Anvil fork.
+On Sepolia the registrar charges Circle's testnet USDC ([faucet.circle.com](https://faucet.circle.com)). Registration checkout also supports payment tokens quoted through CoW Swap, which converts the selected token to the required USDC. The auto-fund faucet only runs against the local Anvil fork.
 
 `VITE_AVATAR_UPLOAD_URL` selects the avatar/header upload service independently
 of `VITE_ENS_NETWORK`. The committed `.env` and `.env.ci` use
@@ -86,8 +84,10 @@ The mainnet token rate limiter uses a separate namespace.
 
 ## Further reading
 
+- [CoW Shed registration flow](../../cow-shed-registration-flow.md): Sepolia EOA token payments, wallet requests, recovery, and verification limits.
+
 - [`docs/FEATURE_FLAGS.md`](docs/FEATURE_FLAGS.md): env-var and per-user flags.
-- [`docs/I18N.md`](docs/I18N.md): the Lingui and Crowdin workflow.
+- Translation commands in [`package.json`](package.json): `pnpm i18n:extract` updates the catalogs; `pnpm i18n:compile` compiles them.
 - [`docs/HCA_MIGRATION_RELEASE_NOTES.md`](docs/HCA_MIGRATION_RELEASE_NOTES.md):
   how migration batches run through the smart account.
 - [`packages/transaction-manager/docs/TRANSACTION_FLOW.md`](../../packages/transaction-manager/docs/TRANSACTION_FLOW.md)

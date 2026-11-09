@@ -1,3 +1,4 @@
+import { COW_SHED_RECOVERY_STORAGE_PREFIX } from '@/features/register-v2/service/cowShedRecovery'
 import { REGISTRATION_RESUME_STORAGE_KEY } from '@/features/register-v2/service/registrationPersistence'
 
 // Blanket localStorage.clear() corrupts reconnection — preserve wagmi.*
@@ -21,6 +22,8 @@ const PRESERVED_KEY_PREFIXES = [
   'wagmi',
   'ens-session',
   REGISTRATION_RESUME_STORAGE_KEY,
+  // Signed hooks remain valid after disconnect.
+  COW_SHED_RECOVERY_STORAGE_PREFIX,
 ] as const
 
 export const clearAppLocalStorage = () => {

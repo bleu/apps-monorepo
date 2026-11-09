@@ -5,6 +5,7 @@ import {
   readEthUsdPrice,
   type EthPaymentQuote as SwapQuote,
 } from '@ens-apps/transaction-manager'
+import { quoteCowShedPaymentActor } from '@ens-apps/transaction-manager/machines/registration/registration.cow-shed.actors'
 import { TaggedError } from '@ens-apps/utils/neverthrow'
 import { resultQueryOptions } from '@ens-apps/utils/tanstack-query/neverthrow'
 import { $qk } from '@ens-apps/utils/tanstack-query/queryKey'
@@ -24,6 +25,10 @@ export type EthPaymentQuote = SwapQuote &
     gasReserve: bigint
     /** Chainlink ETH/USD (8 decimals), present only for native ETH. */
     ethUsd?: bigint
+    cowShed?: Readonly<{
+      executionBudget: bigint
+      firstOrderValidTo: number
+    }>
   }>
 
 export type EthPaymentQuoteParams = Readonly<{
@@ -61,15 +66,26 @@ const getEthPaymentQuote = ({
     )
   }
   return ResultAsync.combine([
-    quoteEthPaymentActor({
-      owner,
-      hca: receiver,
-      permitValue,
-      publicClient,
-      chainId: chain.id,
-      sellToken,
-      includeRegistrationHooks,
-    }),
+    includeRegistrationHooks && chain.id === 11155111
+      ? quoteCowShedPaymentActor({
+          owner,
+          publicClient,
+          chainId: chain.id,
+          registrationPrice: permitValue,
+          sellToken,
+        }).map(({ executionBudget, firstOrderValidTo, ...quote }) => ({
+          ...quote,
+          cowShed: { executionBudget, firstOrderValidTo },
+        }))
+      : quoteEthPaymentActor({
+          owner,
+          hca: receiver,
+          permitValue,
+          publicClient,
+          chainId: chain.id,
+          sellToken,
+          includeRegistrationHooks,
+        }).map((quote) => ({ ...quote, cowShed: undefined })),
     ResultAsync.fromPromise(
       sellToken.isNative
         ? publicClient.getBalance({ address: owner })

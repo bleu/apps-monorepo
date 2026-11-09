@@ -58,6 +58,10 @@ import {
 } from '../lib/paymentReceiptFigures'
 import { getPremiumLabel } from '../lib/premiumLabel'
 import { computeRegistrationFunding } from '../lib/registrationFunding'
+import {
+  getWalletSigningView,
+  type WalletSigningInput,
+} from '../lib/walletSigning'
 import { EthNameText } from './EthNameText'
 import {
   canPayWithEth,
@@ -82,6 +86,7 @@ import { NetworkFeeReceipt, PaymentReceipt } from './PaymentReceipt'
 import { PriceCooldownPill } from './PriceCooldownPill'
 import { RECEIPT_LABEL } from './receiptTypography'
 import { TokenListItem } from './TokenListItem'
+import { WalletSigningProgress } from './WalletSigningProgress'
 
 const MEDIUM_NAME_CHAR_THRESHOLD = 10
 const LONG_NAME_CHAR_THRESHOLD = 43
@@ -199,7 +204,21 @@ export const TokenPickerContent = () => {
       // Paid from an L2, the wallet signs that payment instead.
       state?.matches('bridgingFromL2') ||
       // Paid with ETH, the wallet swaps it for the USDC first.
-      state?.matches('swappingEth'),
+      state?.matches('swappingEth') ||
+      state?.matches('runningCowShedRegistration'),
+  )
+  const walletSigning = useSelector(
+    registrationActor,
+    (state): WalletSigningInput | undefined => {
+      const token = state?.context.ethFunding?.sellToken
+      const progress = state?.context.walletProgress
+      if (!token || !progress) return undefined
+      return {
+        token,
+        progress,
+        hasSignedHooks: state.context.cowShedRun !== undefined,
+      }
+    },
   )
   useRegistrationLockHeartbeat(
     approvalState.isApproving ? approvalState.ownerAddress : undefined,
@@ -320,7 +339,7 @@ export const TokenPickerContent = () => {
   // The page's figure, from the budget's own balance read, so the receipt's lines share one snapshot.
   const registrationTotalRaw = getCheckoutTotalRaw(
     pricingQuery.data?.totalPriceRaw,
-    budgetQuery.data?.hcaBalance,
+    isBudgetRequired ? budgetQuery.data?.hcaBalance : 0n,
   )
   const hasBudgetQuoteFailed = isBudgetRequired && budgetQuery.isError
 
@@ -392,6 +411,7 @@ export const TokenPickerContent = () => {
           tokens: cowTokens,
           selectedToken: selectedCowToken,
           row: ethRow,
+          cowShed: ethQuoteQuery.data?.cowShed,
           isSelected: paymentAsset === 'eth',
           onSelect: (token: CowPaymentToken) => {
             setSelectedCowTokenAddress(token.address)
@@ -415,6 +435,9 @@ export const TokenPickerContent = () => {
     ? {
         displayedCharge: ethPayment?.row.chargeRaw,
         sellToken: selectedCowToken,
+        cowShed: ethQuoteQuery.isPlaceholderData
+          ? undefined
+          : ethQuoteQuery.data?.cowShed,
       }
     : undefined
 
@@ -590,7 +613,7 @@ export const TokenPickerContent = () => {
     .with(
       {
         isPaidFromElsewhere: true,
-        approvalState: { approvalOutcome: 'failed', errorMessage: P.string },
+        approvalState: { errorMessage: P.string },
       },
       ({ approvalState }) => approvalState.errorMessage,
     )
@@ -724,13 +747,16 @@ export const TokenPickerContent = () => {
       pricingData={pricingQuery.data?.totalPriceNumber}
       pricingLoading={pricingQuery.isLoading}
       registrationReceipt={
-        isBudgetRequired ? { totalRaw: registrationTotalRaw } : undefined
+        isBudgetRequired || ethFunding?.cowShed
+          ? { totalRaw: registrationTotalRaw }
+          : undefined
       }
       revalidatedShortfall={revalidatedShortfall}
       selectedToken={selectedToken}
       shortfallLabel={<Trans>Register name</Trans>}
       showNetworkFeeDetails
       stablecoinBalances={stablecoinBalances}
+      walletSigning={walletSigning}
     />
   )
 }
@@ -739,7 +765,7 @@ export const TokenPickerContent = () => {
 const getEthPaymentRow = (
   quote: {
     readonly data?: {
-      readonly swap?: { readonly maximumEth: bigint }
+      readonly swap?: { readonly maximumSell: bigint }
       readonly walletBalance: bigint
       readonly gasReserve: bigint
       readonly ethUsd?: bigint
@@ -764,7 +790,7 @@ const getEthPaymentRow = (
         chargeRaw:
           quote.data === undefined
             ? undefined
-            : (quote.data.swap?.maximumEth ?? 0n),
+            : (quote.data.swap?.maximumSell ?? 0n),
         balanceRaw: quote.data?.walletBalance,
         gasReserveRaw: quote.data?.gasReserve ?? 0n,
         ethUsdRaw: quote.data?.ethUsd,
@@ -778,6 +804,10 @@ type EthPaymentProps = Readonly<{
   tokens?: readonly CowPaymentToken[]
   selectedToken?: CowPaymentToken
   row: EthPaymentRow
+  cowShed?: Readonly<{
+    executionBudget: bigint
+    firstOrderValidTo: number
+  }>
   isSelected: boolean
   onSelect: (token: CowPaymentToken) => void
   onFallbackSelect: () => void
@@ -844,6 +874,23 @@ const getShownFunding = (
   funding && selectedL2?.amountInRaw !== undefined
     ? getL2FundingSummary(funding, selectedL2.amountInRaw)
     : funding
+
+const getRegistrationNetworkFee = ({
+  selectedEth,
+  executionBudget,
+  funding,
+}: {
+  readonly selectedEth: EthPaymentRow | undefined
+  readonly executionBudget: bigint | undefined
+  readonly funding: RegistrationFundingSummary | undefined
+}) => ({
+  extraFeeRaw:
+    getEthSwapGasUsdcRaw(selectedEth) +
+    (selectedEth ? (executionBudget ?? 0n) : 0n),
+  networkFee:
+    funding?.networkFee ??
+    (selectedEth && executionBudget !== undefined ? 0 : undefined),
+})
 
 /** Highest L2 balance first; an unread balance goes last. */
 const byBalanceDescending = (a: L2PaymentRow, b: L2PaymentRow) => {
@@ -993,7 +1040,12 @@ const getEthMethodItems = (
               onSelect={() => ethPayment.onSelect(token)}
               row={
                 isTokenSelected
-                  ? ethPayment.row
+                  ? {
+                      ...ethPayment.row,
+                      balanceRaw: ethPayment.tokens
+                        ? token.balance
+                        : ethPayment.row.balanceRaw,
+                    }
                   : {
                       chargeRaw: undefined,
                       balanceRaw: token.balance,
@@ -1136,6 +1188,7 @@ const PaymentPicker = <T extends TOKEN_SYMBOL>({
   l2Payment,
   ethPayment,
   registrationReceipt,
+  walletSigning,
 }: {
   /** The name being paid for, shown as the heading unless `header` replaces it. */
   readonly label?: string
@@ -1199,8 +1252,11 @@ const PaymentPicker = <T extends TOKEN_SYMBOL>({
   readonly ethPayment?: EthPaymentProps
   /** Registration only: the receipt shows the page's total and the network fee instead of the existing balance. */
   readonly registrationReceipt?: Readonly<{ totalRaw: bigint | undefined }>
+  readonly walletSigning?: WalletSigningInput
 }) => {
   const { t } = useLingui()
+  const signingView =
+    isBusy && walletSigning ? getWalletSigningView(walletSigning) : undefined
 
   const hasBalances = (stablecoinBalances?.length || 0) > 0
 
@@ -1493,27 +1549,39 @@ const PaymentPicker = <T extends TOKEN_SYMBOL>({
           />
         ) : (
           <NetworkFeeReceipt
-            extraFeeRaw={getEthSwapGasUsdcRaw(selectedEth)}
-            networkFee={shownFunding?.networkFee}
+            {...getRegistrationNetworkFee({
+              selectedEth,
+              executionBudget: ethPayment?.cowShed?.executionBudget,
+              funding: shownFunding,
+            })}
             registrationTotalRaw={registrationReceipt.totalRaw}
             state={receiptState}
           />
         )}
 
+        {signingView && <WalletSigningProgress view={signingView} />}
         <PaymentAction
           canNext={canNext}
-          helpMessage={helpMessage}
+          helpMessage={
+            signingView?.current
+              ? t(signingView.current.description)
+              : helpMessage
+          }
           isBusy={isBusy}
           isSettling={isSettling}
-          label={getActionLabel({
-            isSelectionShort: isSelectedMethodShort(
-              isWalletSelectionShort,
-              selectedL2,
-              selectedEth,
-            ),
-            nextMessage,
-            shortfallLabel,
-          })}
+          label={
+            signingView?.current
+              ? t(signingView.current.label)
+              : getActionLabel({
+                  isSelectionShort: isSelectedMethodShort(
+                    isWalletSelectionShort,
+                    selectedL2,
+                    selectedEth,
+                  ),
+                  nextMessage,
+                  shortfallLabel,
+                })
+          }
           onNext={onNext}
           onRetry={
             hasBudgetQuoteFailed && !isQuotingFunding ? onRetry : undefined
@@ -1543,9 +1611,11 @@ export const TokenPickerContentBase = <T extends TOKEN_SYMBOL>(
     <PaymentPicker
       {...held}
       globalErrorMessage={props.globalErrorMessage}
+      helpMessage={props.helpMessage}
       isBusy={props.isBusy}
       nextMessage={props.nextMessage}
       revalidatedShortfall={props.revalidatedShortfall}
+      walletSigning={props.walletSigning}
     />
   )
 }

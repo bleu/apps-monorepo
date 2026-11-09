@@ -6,6 +6,7 @@ import { useCountdown } from '@/hooks/useCountdown'
 import type { RegistrationStage } from '../../state/registration.stages'
 import { RegisterV2Context } from '../../state/registrationUi.context'
 import { useRegisteringStage } from '../../state/registrationUi.selectors'
+import { CowShedProgress } from '../shared/CowShedProgress'
 import { CenteredWeaveLoader } from './components/CenteredWeaveLoader'
 import { NotificationSettings } from './components/NotificationSettings'
 import { PrimaryNameSetupNotice } from './components/PrimaryNameSetupNotice'
@@ -41,6 +42,8 @@ const useChildRegistrationState = RegisterV2Context.createTxSelector(
     registrationTxId: state?.context.registrationTxId,
     registerReadyTimestamp: state?.context.registerReadyTimestamp ?? null,
     l2FundingChainName: state?.context.l2Funding?.chain.name,
+    cowShedStage: state?.context.cowShedRun?.stage,
+    cowShedProgress: state?.context.cowShedRun,
     value: state?.value ?? 'idle',
   }),
 )
@@ -111,6 +114,8 @@ const useRegisteringDisplay = () => {
   return {
     stageDescription,
     stageLabel: i18n._(stageMessages.stageLabel),
+    cowShedProgress: childRegistrationState.cowShedProgress,
+    childMachineState: childRegistrationState.value,
   }
 }
 
@@ -138,7 +143,14 @@ export const RegisteringStep = ({
   const { t } = useLingui()
   const { uiActor, label } = RegisterV2Context.use()
   const uiStage = useRegisteringStage(uiActor)
-  const { stageDescription, stageLabel } = useRegisteringDisplay()
+  const { stageDescription, stageLabel, cowShedProgress, childMachineState } =
+    useRegisteringDisplay()
+  const progressTracker = cowShedProgress ? (
+    <CowShedProgress
+      machineState={childMachineState}
+      progress={cowShedProgress}
+    />
+  ) : null
 
   const notificationsCompleted = uiStage?.notifications === 'completed'
   // Keep the loader up through post-registration setup (primary name / ETH
@@ -197,12 +209,19 @@ export const RegisteringStep = ({
 
   if (showCenteredLoader) {
     return (
-      <CenteredWeaveLoader
-        animate={animateNameFill}
-        description={holdForFill ? undefined : stageDescription}
-        name={fullName}
-        progress={fillProgress}
-      />
+      <div>
+        <CenteredWeaveLoader
+          animate={animateNameFill}
+          description={holdForFill ? undefined : stageDescription}
+          name={fullName}
+          progress={fillProgress}
+        />
+        {progressTracker && (
+          <div className="mx-auto w-full max-w-2xl px-4 pb-4">
+            {progressTracker}
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -222,6 +241,7 @@ export const RegisteringStep = ({
         )}
       </div>
       <div className="mx-auto w-full-[32px] max-w-6xl space-y-6.5">
+        {progressTracker}
         {match(uiStage)
           .with({ notifications: 'settings' }, () => (
             <NotificationSettings

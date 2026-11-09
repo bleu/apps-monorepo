@@ -13,6 +13,7 @@ export type RegisteringTxSnapshot = {
   primaryNameTxId?: string
   /** The L2 a run pays from, whose commit leg the wallet signs there. */
   l2FundingChainName?: string
+  cowShedStage?: string
 }
 
 export type TransactionState = string | undefined
@@ -45,6 +46,41 @@ export const getRegistrationStageMessages = (
         stageLabel: msg`Checking your earlier payment`,
         stageDescription: msg`Waiting for the payment you already signed to arrive`,
       }),
+    )
+    .with({ stage: 'runningCowShedRegistration' }, () =>
+      match(tx.cowShedStage)
+        .with('prepared', () => ({
+          stageLabel: msg`Authorize CoW payment`,
+          stageDescription: msg`Approve the token if needed, then sign the payment order or submit the ETH payment.`,
+        }))
+        .with('fundingSubmission', () => ({
+          stageLabel: msg`Submitting CoW payment`,
+          stageDescription: msg`Payment submission is in progress. Acceptance is not yet confirmed.`,
+        }))
+        .with('fundingSent', () => ({
+          stageLabel: msg`Waiting for token payment`,
+          stageDescription: msg`Waiting for the first CoW order and its commitment hook to settle.`,
+        }))
+        .with('funded', () => ({
+          stageLabel: msg`Waiting for registration eligibility`,
+          stageDescription: msg`Waiting for the registrar's minimum commitment age. Keep this page open to publish the second order when the commitment is ready.`,
+        }))
+        .with('publishing', () => ({
+          stageLabel: msg`Publishing registration order`,
+          stageDescription: msg`The registration order is being published. Acceptance is not yet confirmed.`,
+        }))
+        .with('revealSent', () => ({
+          stageLabel: msg`Waiting for registration settlement`,
+          stageDescription: msg`The second CoW order is published. Waiting for its registration hook, then checking ownership on-chain.`,
+        }))
+        .with('settled', () => ({
+          stageLabel: msg`Verifying registration on-chain`,
+          stageDescription: msg`The order settled. Registration still needs to be confirmed on-chain.`,
+        }))
+        .otherwise(() => ({
+          stageLabel: msg`Preparing CoW Shed registration`,
+          stageDescription: msg`Preparing the signed commitment and registration hooks.`,
+        })),
     )
     .with({ stage: 'swappingEth' }, () => ({
       stageLabel: msg`Paying with your selected token`,

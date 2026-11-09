@@ -1,3 +1,4 @@
+import type { CowShedProgress } from '@ens-apps/transaction-manager'
 import { Trans, useLingui } from '@lingui/react/macro'
 import { useNavigate } from '@tanstack/react-router'
 import { Clock } from 'lucide-react'
@@ -7,8 +8,21 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { RegisterV2Context } from '../../state/registrationUi.context'
 
+import { CowShedProgress as CowShedProgressTracker } from '../shared/CowShedProgress'
+import { getCowShedProgressView } from '../shared/CowShedProgress.view'
+
 export const FailureStep = () => {
   const { uiActor, label, resume } = RegisterV2Context.use()
+  const liveCowShedRun = RegisterV2Context.useTxSelector(
+    (state) => state?.context.cowShedRun,
+  )
+  const restoredCowShedRun = RegisterV2Context.useSelector(
+    (state) => state.context.restoredRun?.cowShedRun,
+  )
+  const isRecoveryOnly = RegisterV2Context.useSelector(
+    (state) => state.context.restoredRun?.recoveryReason !== undefined,
+  )
+  const cowShedProgress = liveCowShedRun ?? restoredCowShedRun
   const navigate = useNavigate()
   const message = RegisterV2Context.useSelector(
     (state) => state.context.lastErrorMessage,
@@ -39,6 +53,8 @@ export const FailureStep = () => {
 
   return (
     <FailureStepView
+      cowShedProgress={cowShedProgress}
+      isRecoveryOnly={isRecoveryOnly}
       isWalletBusy={isWalletBusy}
       label={label}
       message={message}
@@ -55,6 +71,8 @@ export const FailureStep = () => {
 
 interface FailureStepViewProps {
   readonly label: string
+  readonly cowShedProgress?: CowShedProgress
+  readonly isRecoveryOnly?: boolean
   readonly message?: string
   readonly nameUnavailable?: boolean
   /** This run was refused because the wallet is busy, rather than failing. */
@@ -70,11 +88,18 @@ export const FailureStepView = ({
   message,
   nameUnavailable,
   isWalletBusy = false,
+  isRecoveryOnly = false,
+  cowShedProgress,
   onRetry,
   onCancel,
   onFindAnotherName,
 }: FailureStepViewProps) => {
   const { t } = useLingui()
+  const progress = isWalletBusy ? undefined : cowShedProgress
+  const isConfirmationFailure = progress
+    ? getCowShedProgressView({ progress, machineState: 'error' })
+        .isConfirmationFailure
+    : false
 
   return (
     <div className="mx-auto mt-12 mb-4 w-full-[32px] max-w-6xl space-y-6.5">
@@ -83,23 +108,55 @@ export const FailureStepView = ({
         variant="destructive"
       >
         <AlertTitle>
-          {match({ nameUnavailable, isWalletBusy })
+          {match({
+            nameUnavailable,
+            isWalletBusy,
+            isConfirmationFailure,
+            isRecoveryOnly,
+          })
             .with({ nameUnavailable: true }, () => (
               <Trans>Name No Longer Available</Trans>
             ))
             .with({ isWalletBusy: true }, () => (
               <Trans>Another Registration Is Running</Trans>
             ))
+            .with({ isRecoveryOnly: true }, () => (
+              <Trans>Registration authorization expired</Trans>
+            ))
+            .with({ isConfirmationFailure: true }, () => (
+              <Trans>Registration confirmation failed</Trans>
+            ))
             .otherwise(() => (
               <Trans>Registration Failed</Trans>
             ))}
         </AlertTitle>
         <AlertDescription className="max-h-32 overflow-y-auto">
-          {match({ nameUnavailable, message })
+          {match({
+            nameUnavailable,
+            message,
+            progress,
+            isConfirmationFailure,
+            isRecoveryOnly,
+          })
             .with(
               { nameUnavailable: true },
               () =>
                 t`${label}.eth was registered by someone else just before your registration went through.`,
+            )
+            .with(
+              { isRecoveryOnly: true },
+              () =>
+                t`This commitment expired. This attempt cannot continue. Use CoW Swap to recover any remaining funds.`,
+            )
+            .with(
+              { isConfirmationFailure: true },
+              () =>
+                t`The order settled, but registration could not be confirmed. Try Again will check registration without making a new payment.`,
+            )
+            .with(
+              { progress: P.not(P.nullish) },
+              () =>
+                t`Registration stopped at the step shown below. Try Again will continue from the saved progress.`,
             )
             .with({ message: P.string.minLength(1) }, ({ message }) => message)
             .otherwise(
@@ -108,6 +165,20 @@ export const FailureStepView = ({
             )}
         </AlertDescription>
       </Alert>
+
+      {progress && (
+        <CowShedProgressTracker machineState="error" progress={progress} />
+      )}
+      {progress && message && !nameUnavailable && (
+        <details className="min-w-0 text-ens-gray text-sm">
+          <summary className="cursor-pointer rounded-sm focus-visible:outline-2">
+            <Trans>Error details</Trans>
+          </summary>
+          <p className="wrap-anywhere mt-2 max-h-32 overflow-y-auto">
+            {message}
+          </p>
+        </details>
+      )}
 
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:gap-16">
         <div className="w-full lg:w-1/2">
@@ -120,11 +191,17 @@ export const FailureStepView = ({
               <Trans>What would you like to do?</Trans>
             </h3>
             <p className="text-ens-gray text-sm">
-              {match({ nameUnavailable, isWalletBusy })
+              {match({ nameUnavailable, isWalletBusy, isRecoveryOnly })
                 .with({ nameUnavailable: true }, () => (
                   <Trans>
                     Another address registered this name first, so it can no
                     longer be registered here. Look for a different name.
+                  </Trans>
+                ))
+                .with({ isRecoveryOnly: true }, () => (
+                  <Trans>
+                    Recover any remaining funds before starting another
+                    registration.
                   </Trans>
                 ))
                 .with({ isWalletBusy: true }, () => (
@@ -143,7 +220,7 @@ export const FailureStepView = ({
           </div>
 
           <div className="flex gap-3">
-            {!nameUnavailable && (
+            {!nameUnavailable && !isRecoveryOnly && (
               <Button
                 className="flex-1"
                 onClick={onRetry}

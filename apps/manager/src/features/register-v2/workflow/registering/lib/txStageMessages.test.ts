@@ -2,6 +2,21 @@ import { describe, expect, it } from 'vitest'
 import { getRegistrationStageMessages } from './txStageMessages'
 
 describe('getRegistrationStageMessages', () => {
+  it.each([
+    ['fundingSubmission', 'Submitting CoW payment'],
+    ['publishing', 'Publishing registration order'],
+    ['settled', 'Verifying registration on-chain'],
+  ] as const)(
+    'keeps the %s stage distinct from accepted or confirmed',
+    (cowShedStage, label) => {
+      expect(
+        getRegistrationStageMessages(
+          { value: 'runningCowShedRegistration', cowShedStage },
+          undefined,
+        ).stageLabel.message,
+      ).toBe(label)
+    },
+  )
   it('maps waiting for commitment pending stage', () => {
     const message = getRegistrationStageMessages(
       { value: 'waitingForCommitment' },

@@ -78,6 +78,7 @@ export type RegistrationResumeState =
    * through the same session gate and dispatch as a resume.
    */
   | { readonly status: 'failed'; readonly retry: () => void }
+  | { readonly status: 'recovery-only' }
 
 type ContinuableVerdict = Extract<
   ResumeAssessment,
@@ -133,7 +134,10 @@ type SettledDecision =
   /** A failed run owned by the connected wallet — show it, run nothing. */
   | {
       readonly kind: 'restore-failure'
-      readonly verdict: Extract<ResumeAssessment, { status: 'failed' }>
+      readonly verdict: Extract<
+        ResumeAssessment,
+        { status: 'failed' | 'recovery-only' }
+      >
     }
 
 function decideFromVerdict(
@@ -175,10 +179,23 @@ function decideFromVerdict(
     }
   }
 
-  return verdict.status === 'failed'
-    ? { kind: 'restore-failure', verdict }
-    : { kind: 'dispatch', verdict }
+  return verdict.status === 'resumable'
+    ? { kind: 'dispatch', verdict }
+    : { kind: 'restore-failure', verdict }
 }
+
+const failureRestoreEvent = (
+  verdict: Extract<ResumeAssessment, { status: 'failed' | 'recovery-only' }>,
+) => ({
+  type: 'registration.failure.restore' as const,
+  confirmedData: verdict.confirmedData,
+  run: {
+    ...storedRegistrationKey(verdict.stored),
+    cowShedRun: verdict.stored.record.context.cowShedRun,
+    recoveryReason:
+      verdict.status === 'recovery-only' ? verdict.reason : undefined,
+  },
+})
 
 /**
  * The imperative tail of a resume: the session gate, then the one-shot
@@ -293,6 +310,11 @@ async function continueFailedRun(params: {
     if (decision.state.status !== 'discarded') return null
     uiActor.send({ type: 'cancel' })
     return decision.state
+  }
+
+  if (decision.verdict.status === 'recovery-only') {
+    uiActor.send(failureRestoreEvent(decision.verdict))
+    return { status: 'recovery-only' }
   }
 
   const next = await enableSessionAndDispatch({
@@ -431,18 +453,22 @@ export function useRegistrationResume(params: {
 
       // Shown, not resumed: re-entering a failed run on load would replay the
       // failure, or open a wallet prompt nobody asked for.
-      const { stored, confirmedData } = decision.verdict
-      uiActor.send({
-        type: 'registration.failure.restore',
-        confirmedData,
-        run: storedRegistrationKey(stored),
-      })
+      uiActor.send(failureRestoreEvent(decision.verdict))
       decidedForLabel.current = label
       // Dropped unless the page was still on pricing, so nothing is shown.
       const isShown = uiActor.getSnapshot().context.restoredRun !== undefined
       setSettled({
         label,
-        state: isShown ? { status: 'failed', retry: retryFailedRun } : IDLE,
+        state: match({ isShown, status: decision.verdict.status })
+          .with({ isShown: false }, () => IDLE)
+          .with(
+            { status: 'recovery-only' },
+            (): RegistrationResumeState => ({ status: 'recovery-only' }),
+          )
+          .otherwise(() => ({
+            status: 'failed' as const,
+            retry: retryFailedRun,
+          })),
       })
     },
     [label, uiActor, retryFailedRun],

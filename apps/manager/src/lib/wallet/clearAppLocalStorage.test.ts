@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { COW_SHED_RECOVERY_STORAGE_PREFIX } from '@/features/register-v2/service/cowShedRecovery'
 import { REGISTRATION_RESUME_STORAGE_KEY } from '@/features/register-v2/service/registrationPersistence'
 import { clearAppLocalStorage } from './clearAppLocalStorage'
 
@@ -15,6 +16,15 @@ describe('clearAppLocalStorage', () => {
     expect(localStorage.getItem(REGISTRATION_RESUME_STORAGE_KEY)).toBe(
       '{"v":1}',
     )
+  })
+
+  it('keeps signed Shed hook recovery across disconnect', () => {
+    const key = `${COW_SHED_RECOVERY_STORAGE_PREFIX}11155111:0x1111111111111111111111111111111111111111`
+    localStorage.setItem(key, 'signed hook recovery')
+
+    clearAppLocalStorage()
+
+    expect(localStorage.getItem(key)).toBe('signed hook recovery')
   })
 
   it('keeps the wallet connection and HCA sessions, and clears the rest', () => {

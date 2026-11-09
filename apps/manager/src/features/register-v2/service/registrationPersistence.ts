@@ -147,34 +147,20 @@ const decodeConfirmedData = (
   premiumPriceNumber: stored.premiumPriceNumber,
 })
 
-/**
- * Read the stored registration, if there is a usable one.
- *
- * Returns `null` for every failure mode — absent, unreadable storage, corrupt
- * JSON, stale app schema, or a package record the package itself rejected
- * (wrong version, protocol drift). Callers treat all of them the same way:
- * there is nothing to resume.
- */
+/** Return the current-format record, or null when it cannot resume. */
 export function loadStoredRegistration(
   storage: StorageLike | null = getBrowserStorage(),
 ): StoredRegistration | null {
   if (!storage) return null
 
-  let raw: string | null
-  try {
-    raw = storage.getItem(REGISTRATION_RESUME_STORAGE_KEY)
-  } catch {
-    return null
-  }
-  if (!raw) return null
-
   let parsed: unknown
   try {
+    const raw = storage.getItem(REGISTRATION_RESUME_STORAGE_KEY)
+    if (!raw) return null
     parsed = JSON.parse(raw)
   } catch {
     return null
   }
-
   const envelope = v.safeParse(envelopeSchema, parsed)
   if (!envelope.success) return null
   if (envelope.output.v !== REGISTRATION_RESUME_VERSION) return null
@@ -182,13 +168,14 @@ export function loadStoredRegistration(
   const record = parseRegistrationRecord(envelope.output.record)
   if (record.isErr()) return null
 
-  // A record whose halves disagree about the label is not something to guess
-  // at — the commitment binds the label, so resuming the wrong one would
-  // produce a commitment that can never be revealed.
-  const context = record.value.context
-  const contextLabel = context.name.replace(/\.eth$/, '')
-  if (contextLabel !== envelope.output.label) return null
-  if (envelope.output.confirmedData.label !== envelope.output.label) return null
+  // The commitment binds the name, so mismatched labels cannot resume.
+  const contextLabel = record.value.context.name.replace(/\.eth$/, '')
+  if (
+    contextLabel !== envelope.output.label ||
+    envelope.output.confirmedData.label !== envelope.output.label
+  ) {
+    return null
+  }
 
   return {
     label: envelope.output.label,
@@ -196,6 +183,45 @@ export function loadStoredRegistration(
     confirmedData: decodeConfirmedData(envelope.output.confirmedData),
     postRegistrationSetup: envelope.output.postRegistrationSetup,
   }
+}
+
+type CowShedRunIdentity = Pick<
+  PersistedRegistrationRecord['context'],
+  'chainId' | 'name' | 'ownerAddress' | 'commitment'
+>
+
+const failedCowShedRegistration = (
+  stored: StoredRegistration | null,
+  context: CowShedRunIdentity,
+): StoredRegistration | null => {
+  if (
+    !stored?.record.context.cowShedRun ||
+    !context.commitment ||
+    stored.record.context.commitment?.commitment !==
+      context.commitment.commitment ||
+    stored.record.context.chainId !== context.chainId ||
+    stored.record.context.name !== context.name ||
+    stored.record.context.ownerAddress?.toLowerCase() !==
+      context.ownerAddress?.toLowerCase()
+  )
+    return null
+  return { ...stored, record: { ...stored.record, stage: 'error' } }
+}
+
+export function markStoredCowShedRegistrationFailed(
+  context: CowShedRunIdentity,
+  storage: StorageLike | null = getBrowserStorage(),
+): void {
+  const failed = failedCowShedRegistration(
+    loadStoredRegistration(storage),
+    context,
+  )
+  if (!failed) return
+  createRegistrationPersistenceAdapter({
+    label: failed.label,
+    getAppState: () => failed,
+    storage,
+  }).save(failed.record)
 }
 
 export function clearStoredRegistration(
@@ -235,6 +261,7 @@ export function clearStoredRegistrationIfUnchanged(
   storage: StorageLike | null = getBrowserStorage(),
 ): void {
   const stored = loadStoredRegistration(storage)
+  if (stored?.record.context.cowShedRun) return
   if (
     stored?.label !== key.label ||
     stored.record.updatedAt !== key.updatedAt
@@ -274,16 +301,25 @@ export function createRegistrationPersistenceAdapter(options: {
   label: string
   getAppState: () => RegistrationAppState | undefined
   storage?: StorageLike | null
+  requireDurableSave?: boolean
 }): RegistrationPersistenceAdapter {
   const storage =
     options.storage === undefined ? getBrowserStorage() : options.storage
 
   return {
     save(record) {
-      if (!storage) return
+      if (!storage) {
+        if (options.requireDurableSave)
+          throw new Error('Registration recovery storage is unavailable')
+        return
+      }
 
       const appState = options.getAppState()
-      if (!appState?.confirmedData) return
+      if (!appState?.confirmedData) {
+        if (options.requireDurableSave)
+          throw new Error('Registration recovery pricing is unavailable')
+        return
+      }
 
       const envelope: StoredRegistrationEnvelope = {
         v: REGISTRATION_RESUME_VERSION,
@@ -298,7 +334,8 @@ export function createRegistrationPersistenceAdapter(options: {
           REGISTRATION_RESUME_STORAGE_KEY,
           JSON.stringify(envelope),
         )
-      } catch {
+      } catch (cause) {
+        if (options.requireDurableSave) throw cause
         // Quota or private mode. The user loses resume, not the registration.
       }
     },
