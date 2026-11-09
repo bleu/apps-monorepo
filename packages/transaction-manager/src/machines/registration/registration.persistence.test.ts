@@ -2,8 +2,11 @@ import type { Address, Hash, Hex, PublicClient } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
 import { createActor, fromPromise, waitFor } from 'xstate'
 import { TransactionUserRejectedError } from '../../errors/transaction.errors'
+import { NATIVE_ETH } from '../../helpers/eth-usdc-swap'
 import type { Signer } from '../../types/signer.types'
 import type { TransactionRequest } from '../../types/transaction.types'
+import { prepareCowShedQuoteHooks } from './registration.cow-shed'
+import type { CowShedProgress } from './registration.cow-shed.actors'
 import type { RegistrationContext } from './registration.machine'
 import { registrationMachine } from './registration.machine'
 import {
@@ -43,6 +46,34 @@ const baseContext = (
   ...overrides,
 })
 
+const makeShedProgress = async (): Promise<CowShedProgress> => {
+  const authorization = {
+    chainId: 11155111,
+    wallet: OWNER,
+    resolver: RESOLVER,
+    name: 'leon.eth',
+    duration: 31_536_000n,
+    secret: SECRET,
+    commitment: COMMITMENT,
+    registrationPrice: 5_000_000n,
+    executionBudget: 100_000n,
+    firstOrderValidTo: 1_800_000_000n,
+    secondOrderValidTo: 1_800_003_600n,
+    salt: COMMITMENT,
+    setupNonce: COMMITMENT,
+    registrationNonce: SECRET,
+  }
+  return {
+    stage: 'fundingSubmission',
+    plan: {
+      authorization,
+      signed: await prepareCowShedQuoteHooks(authorization),
+      sellToken: NATIVE_ETH,
+      maximumSell: 10n ** 16n,
+    },
+  }
+}
+
 const persisted = (
   overrides: Partial<PersistedRegistrationContext> = {},
 ): PersistedRegistrationContext => ({
@@ -51,6 +82,23 @@ const persisted = (
 })
 
 describe('getResumeTarget', () => {
+  it('resumes a Shed registration without entering the wallet-funded registration path', () => {
+    expect(
+      getResumeTarget({
+        stage: 'runningCowShedRegistration',
+        context: persisted({
+          commitment: { commitment: COMMITMENT, secret: SECRET },
+          ethFunding: {
+            cowShed: {
+              executionBudget: 100_000n,
+              firstOrderValidTo: 1_800_000_000,
+            },
+          },
+        }),
+      }),
+    ).toBe('runningCowShedRegistration')
+  })
+
   it('routes a submitted register to verification, never back to a submit', () => {
     expect(
       getResumeTarget({
@@ -190,6 +238,177 @@ describe('getResumeTarget', () => {
 })
 
 describe('registration record serialization', () => {
+  it('keeps an ambiguous single-order purchase through a reload', async () => {
+    const cowShedRun = await makeShedProgress()
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      baseContext({ cowShedRun }),
+      42,
+    )
+    const restored = parseRegistrationRecord(
+      serializeRegistrationRecord(record),
+    )._unsafeUnwrap()
+    expect(restored.context.cowShedRun).toEqual(cowShedRun)
+    expect(getResumeTarget(restored)).toBe('runningCowShedRegistration')
+  })
+
+  it('rejects unknown fields in Shed checkout metadata', () => {
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      baseContext({
+        ethFunding: {
+          cowShed: {
+            executionBudget: 100_000n,
+            firstOrderValidTo: 1_800_000_000,
+          },
+        },
+      }),
+      42,
+    )
+    const invalid = {
+      ...record,
+      context: {
+        ...record.context,
+        ethFunding: {
+          cowShed: {
+            ...record.context.ethFunding?.cowShed,
+            unexpected: true,
+          },
+        },
+      },
+    }
+    expect(
+      parseRegistrationRecord(serializeRegistrationRecord(invalid)).isErr(),
+    ).toBe(true)
+  })
+
+  it.each([
+    [
+      'progress',
+      (progress: CowShedProgress) => ({ ...progress, unexpected: true }),
+    ],
+    [
+      'plan',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: { ...progress.plan, unexpected: true },
+      }),
+    ],
+    [
+      'authorization',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          authorization: { ...progress.plan.authorization, unexpected: true },
+        },
+      }),
+    ],
+    [
+      'signed hooks',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          signed: { ...progress.plan.signed, unexpected: true },
+        },
+      }),
+    ],
+    [
+      'conditional order',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          signed: {
+            ...progress.plan.signed,
+            conditionalOrder: {
+              ...progress.plan.signed.conditionalOrder,
+              unexpected: true,
+            },
+          },
+        },
+      }),
+    ],
+    [
+      'registration hook',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          signed: {
+            ...progress.plan.signed,
+            registrationHook: {
+              ...progress.plan.signed.registrationHook,
+              unexpected: true,
+            },
+          },
+        },
+      }),
+    ],
+    [
+      'app data',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          signed: {
+            ...progress.plan.signed,
+            registrationAppData: {
+              ...progress.plan.signed.registrationAppData,
+              unexpected: true,
+            },
+          },
+        },
+      }),
+    ],
+    [
+      'sell token',
+      (progress: CowShedProgress) => ({
+        ...progress,
+        plan: {
+          ...progress.plan,
+          sellToken: { ...progress.plan.sellToken, unexpected: true },
+        },
+      }),
+    ],
+  ] as const)('rejects unknown fields in Shed %s', async (_name, addField) => {
+    const invalid = addField(await makeShedProgress())
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      baseContext({ cowShedRun: invalid }),
+      42,
+    )
+    expect(
+      parseRegistrationRecord(serializeRegistrationRecord(record)).isErr(),
+    ).toBe(true)
+  })
+
+  it('rejects a Shed plan with a different conditional-order handler', async () => {
+    const progress = await makeShedProgress()
+    const invalid = {
+      ...progress,
+      plan: {
+        ...progress.plan,
+        signed: {
+          ...progress.plan.signed,
+          conditionalOrder: {
+            ...progress.plan.signed.conditionalOrder,
+            handler: OWNER,
+          },
+        },
+      },
+    }
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      baseContext({ cowShedRun: invalid }),
+      42,
+    )
+    expect(
+      parseRegistrationRecord(serializeRegistrationRecord(record)).isErr(),
+    ).toBe(true)
+  })
+
   it('round-trips bigints and the commitment secret', () => {
     const context = baseContext({
       duration: 63_072_000n,
@@ -499,6 +718,59 @@ const startRegistration = (actor: ReturnType<typeof startParkedActor>) => {
 }
 
 describe('subscribeRegistrationPersistence', () => {
+  it('leaves Shed storage to the awaited progress writer from the start of the run', () => {
+    const adapter = createAdapter()
+    const actor = startParkedActor()
+    subscribeRegistrationPersistence(actor, adapter)
+    actor.start()
+    actor.send({
+      type: 'START_REGISTRATION',
+      name: 'leon.eth',
+      duration: 31_536_000n,
+      token: 'USDC',
+      price: 5_000_000n,
+      signer: eoaSigner,
+      accountAddress: OWNER,
+      ownerAddress: OWNER,
+      publicClient: {} as PublicClient,
+      ethFunding: {
+        cowShed: {
+          executionBudget: 100_000n,
+          firstOrderValidTo: 1_800_000_000,
+        },
+      },
+    })
+    expect(actor.getSnapshot().value).toBe('checkingResolver')
+    expect(adapter.saved).toEqual([])
+    actor.send({ type: 'CANCEL' })
+    expect(adapter.clears).toBe(0)
+    actor.stop()
+  })
+
+  it('keeps a signed Shed authorization when the user cancels the screen', async () => {
+    const adapter = createAdapter()
+    const progress = await makeShedProgress()
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      baseContext({ cowShedRun: progress }),
+      42,
+    )
+    adapter.save(record)
+    const actor = startParkedActor()
+    subscribeRegistrationPersistence(actor, adapter)
+    actor.start()
+    actor.send({
+      type: 'RESUME',
+      stage: record.stage,
+      context: record.context,
+      deps: { signer: eoaSigner, publicClient: {} as PublicClient },
+    })
+    actor.send({ type: 'CANCEL' })
+    expect(adapter.clears).toBe(0)
+    expect(adapter.saved.at(-1)?.context.cowShedRun).toEqual(progress)
+    actor.stop()
+  })
+
   it('does not clear on the initial idle snapshot', () => {
     // The subscriber is attached on mount, before the app has had a chance to
     // read the record it means to resume from. Clearing here would delete it.

@@ -5,10 +5,11 @@ import {
   supportedL1Chains,
 } from '@ensdomains/ensjs/chain'
 import { ethRegistrarRegisterSnippet } from '@ensdomains/ensjs-abi/v2/ethRegistrar'
+import { permissionedRegistryGetStateSnippet } from '@ensdomains/ensjs-abi/v2/permissionedRegistry'
 import type { Address, Hash, Hex, PublicClient, WalletClient } from 'viem'
-import { decodeFunctionData, getChainContractAddress } from 'viem'
+import { decodeFunctionData, getChainContractAddress, zeroAddress } from 'viem'
 import { mainnet, sepolia } from 'viem/chains'
-import { describe, expect, it, vi } from 'vitest'
+import { assert, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SignerAddressMismatchError } from '../../errors/transaction.errors'
 import type {
   EOASigner,
@@ -21,12 +22,21 @@ import {
   getSignerAddress,
   resolvePaymentTokenAddress,
   submitRegistrationActor,
+  verifyRegistrationActor,
 } from './registration.actors'
 
 const mocks = vi.hoisted(() => ({
+  readContract: vi.fn(),
+  multicall: vi.fn(),
   startTransaction: vi.fn(
     (_intent: { readonly request: { readonly data: Hex } }) => 'tx-register',
   ),
+}))
+
+vi.mock('viem/actions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('viem/actions')>()),
+  readContract: mocks.readContract,
+  multicall: mocks.multicall,
 }))
 
 vi.mock('../../providers/transactionManager', () => ({
@@ -206,6 +216,197 @@ describe('resolvePaymentTokenAddress', () => {
       resolvePaymentTokenAddress({ selectedToken: 'USDC' }, mainnetChain),
     ).toBe(shown)
   })
+})
+
+describe('verifyRegistrationActor', () => {
+  const REGISTRAR = '0x3333333333333333333333333333333333333333' as const
+  const REGISTRY = '0x4444444444444444444444444444444444444444' as const
+  const COMMITMENT = `0x${'55'.repeat(32)}` as Hex
+  const publicClient = { chain: extendChainWithEns(sepolia) } as PublicClient
+  const input = {
+    name: 'alice.eth',
+    owner: FROM,
+    resolverAddress: HCA,
+    registrarAddress: REGISTRAR,
+    publicClient,
+    commitment: COMMITMENT,
+    graceWindowMs: 0,
+  }
+
+  beforeEach(() => {
+    mocks.readContract.mockReset().mockImplementation(
+      async (
+        _client: PublicClient,
+        request: {
+          readonly address: Address
+          readonly functionName: string
+          readonly args?: readonly unknown[]
+        },
+      ) => {
+        expect(request.address).toBe(REGISTRAR)
+        if (request.functionName === 'commitmentAt') {
+          expect(request.args).toEqual([COMMITMENT])
+          return 0n
+        }
+        throw new Error('REGISTRY() is not supported')
+      },
+    )
+    mocks.multicall.mockReset().mockImplementation(
+      async (
+        _client: PublicClient,
+        request: {
+          readonly contracts: readonly {
+            readonly address: Address
+            readonly functionName: string
+            readonly args: readonly unknown[]
+          }[]
+        },
+      ) => {
+        expect(request.contracts).toEqual([
+          expect.objectContaining({
+            address: REGISTRY,
+            functionName: 'getResolver',
+            args: ['alice'],
+          }),
+          expect.objectContaining({
+            address: REGISTRY,
+            abi: permissionedRegistryGetStateSnippet,
+            functionName: 'getState',
+            args: [
+              0x9c0257114eb9399a2985f8e75dad7600c5d89fe3824ffa99ec1c3eb8bf3b0501n,
+            ],
+          }),
+          expect.objectContaining({
+            address: REGISTRY,
+            functionName: 'getSubregistry',
+            args: ['alice'],
+          }),
+        ])
+        return [
+          HCA,
+          {
+            status: 2,
+            latestOwner: FROM,
+            expiry: 0n,
+            tokenId: 0n,
+            resource: 0n,
+          },
+          zeroAddress,
+        ]
+      },
+    )
+  })
+
+  it('verifies with an explicit registry when the registrar has no REGISTRY()', async () => {
+    const result = await verifyRegistrationActor({
+      ...input,
+      registryAddress: REGISTRY,
+    })
+
+    assert(result.isOk())
+    expect(result.value).toEqual({
+      verified: true,
+      registeredToOther: false,
+      isUnregistered: false,
+    })
+  })
+
+  it('keeps the REGISTRY() lookup when no registry address is supplied', async () => {
+    mocks.readContract.mockResolvedValueOnce(REGISTRY)
+
+    const result = await verifyRegistrationActor(input)
+
+    assert(result.isOk())
+    expect(result.value).toEqual({
+      verified: true,
+      registeredToOther: false,
+      isUnregistered: false,
+    })
+    expect(mocks.readContract).toHaveBeenCalledWith(
+      publicClient,
+      expect.objectContaining({
+        address: REGISTRAR,
+        functionName: 'REGISTRY',
+      }),
+    )
+  })
+
+  it('does not verify an expired registration with the expected historical owner', async () => {
+    mocks.multicall.mockResolvedValueOnce([
+      HCA,
+      { status: 0, latestOwner: FROM, expiry: 0n, tokenId: 0n, resource: 0n },
+      zeroAddress,
+    ])
+
+    const result = await verifyRegistrationActor({
+      ...input,
+      registryAddress: REGISTRY,
+    })
+
+    assert(result.isOk())
+    expect(result.value).toEqual({
+      verified: false,
+      registeredToOther: false,
+      isUnregistered: true,
+      reason: expect.stringContaining('owner'),
+    })
+    expect(mocks.multicall).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['registry state', 'commitment'] as const)(
+    'returns an error when the %s RPC read fails',
+    async (read) => {
+      const error = new Error('RPC unavailable')
+      const rpc =
+        read === 'registry state' ? mocks.multicall : mocks.readContract
+      rpc.mockRejectedValueOnce(error)
+
+      const result = await verifyRegistrationActor({
+        ...input,
+        registryAddress: REGISTRY,
+      })
+
+      assert(result.isErr())
+      expect(result.error).toBe(error)
+      expect(rpc).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it.each([
+    ['resolver', [HCA_OTHER, FROM, zeroAddress], 0n, false],
+    ['owner', [HCA, HCA_OTHER, zeroAddress], 0n, true],
+    ['subregistry', [HCA, FROM, HCA_OTHER], 0n, false],
+    ['commitment', [HCA, FROM, zeroAddress], 1_700_000n, false],
+  ] as const)(
+    'rejects an explicit-registry registration with a different %s',
+    async (field, registryEntry, commitTime, registeredToOther) => {
+      mocks.multicall.mockResolvedValueOnce([
+        registryEntry[0],
+        {
+          status: 2,
+          latestOwner: registryEntry[1],
+          expiry: 0n,
+          tokenId: 0n,
+          resource: 0n,
+        },
+        registryEntry[2],
+      ])
+      mocks.readContract.mockResolvedValueOnce(commitTime)
+
+      const result = await verifyRegistrationActor({
+        ...input,
+        registryAddress: REGISTRY,
+      })
+
+      assert(result.isOk())
+      expect(result.value).toEqual({
+        verified: false,
+        registeredToOther,
+        isUnregistered: false,
+        reason: expect.stringContaining(field),
+      })
+    },
+  )
 })
 
 describe('submitRegistrationActor', () => {

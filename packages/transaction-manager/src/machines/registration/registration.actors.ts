@@ -21,6 +21,7 @@ import {
 } from '@ensdomains/ensjs-abi/v2/ethRegistrar'
 import {
   permissionedRegistryGetResolverSnippet,
+  permissionedRegistryGetStateSnippet,
   permissionedRegistryGetSubregistrySnippet,
 } from '@ensdomains/ensjs-abi/v2/permissionedRegistry'
 import { permissionedResolverInitializeSnippet } from '@ensdomains/ensjs-abi/v2/permissionedResolver'
@@ -45,6 +46,7 @@ import {
   zeroAddress,
 } from 'viem'
 import { getBlock, multicall, readContract } from 'viem/actions'
+import { labelhash } from 'viem/ens'
 import type { Signer } from '../..'
 import { VERIFIABLE_FACTORY_ABI } from '../../contracts/abis/VerifiableFactory.abi'
 import { getSmartAccountAddress } from '../../helpers/getSmartAccountAddress'
@@ -71,6 +73,7 @@ import {
 import { waitForTransactionReceiptById } from '../../helpers/transaction-status.helpers'
 import { transactionManager } from '../../providers/transactionManager'
 import type { Call, TransactionRequest } from '../../types/transaction.types'
+import { getRegistrationOwnership } from './registration.ownership'
 
 type CommitmentData = {
   commitment: Hash
@@ -923,6 +926,7 @@ export function verifyRegistrationActor(
     commitment: Hex
     /** Override for the standalone-HCA registrar; defaults to the EOA deployment. */
     registrarAddress?: Address
+    readonly registryAddress?: Address
   } & VerifyPollOptions,
 ): ResultAsync<
   {
@@ -949,17 +953,15 @@ export function verifyRegistrationActor(
   }> => {
     // ETHRegistrar.REGISTRY() points at the IPermissionedRegistry where
     // entries are stored. Read the registry, then look up the resolver.
-    const registryAddress = (await readContract(input.publicClient, {
-      address: registrarAddress,
-      abi: parseAbi(['function REGISTRY() view returns (address)']),
-      functionName: 'REGISTRY',
-    })) as Address
+    const registryAddress =
+      input.registryAddress ??
+      ((await readContract(input.publicClient, {
+        address: registrarAddress,
+        abi: parseAbi(['function REGISTRY() view returns (address)']),
+        functionName: 'REGISTRY',
+      })) as Address)
 
-    // ensjs-abi ships no owner-by-label snippet, so that one stays local.
-    const registryOwnerAbi = parseAbi([
-      'function getOwner(string label) view returns (address)',
-    ])
-    const [[resolver, owner, subregistry], commitTime] = await Promise.all([
+    const [[resolver, state, subregistry], commitTime] = await Promise.all([
       multicall(input.publicClient, {
         allowFailure: false,
         contracts: [
@@ -971,9 +973,9 @@ export function verifyRegistrationActor(
           },
           {
             address: registryAddress,
-            abi: registryOwnerAbi,
-            functionName: 'getOwner',
-            args: [cleanName],
+            abi: permissionedRegistryGetStateSnippet,
+            functionName: 'getState',
+            args: [BigInt(labelhash(cleanName))],
           },
           {
             address: registryAddress,
@@ -991,16 +993,8 @@ export function verifyRegistrationActor(
       }),
     ])
 
-    // Lost the race: the label is owned, but by someone else. Distinct from
-    // "not registered yet" — no retry can win it back, so the caller must stop
-    // rather than resubmit.
-    const registeredToOther =
-      !isAddressEqual(owner, zeroAddress) && !isAddressEqual(owner, input.owner)
-
-    // Nobody holds the label: the register never landed, so every `reason`
-    // below can only restate that. Callers then keep the failure that
-    // stopped it instead.
-    const isUnregistered = isAddressEqual(owner, zeroAddress)
+    const { owner, registeredToOther, isUnregistered } =
+      getRegistrationOwnership({ state, expectedOwner: input.owner })
 
     if (
       isAddressEqual(resolver, zeroAddress) ||

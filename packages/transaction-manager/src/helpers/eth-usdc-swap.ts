@@ -8,6 +8,7 @@
 
 import {
   COW_PROTOCOL_VAULT_RELAYER_ADDRESS,
+  calculateUniqueOrderId,
   type EnrichedOrder,
   ETH_ADDRESS,
   getGlobalAdapter,
@@ -43,6 +44,8 @@ import {
 } from 'viem'
 import { readContract, waitForTransactionReceipt } from 'viem/actions'
 import { type Config, createConfig } from 'wagmi'
+
+import type { WalletProgress } from '../machines/registration/registration.wallet-progress'
 
 const APP_CODE = 'ens-app'
 const USDC_DECIMALS = 6
@@ -87,6 +90,9 @@ export const withBps = (value: bigint, bps: bigint): bigint =>
 export class EthSwapUnavailableError extends TaggedError(
   'EthSwapUnavailableError',
 )<{ message: string; cause?: unknown }> {}
+
+/** Submission may be durable or posted; recover before starting another payment. */
+export class CowSwapSubmissionError extends EthSwapUnavailableError {}
 
 export class EthSwapRejectedError extends TaggedError('EthSwapRejectedError')<{
   message: string
@@ -271,7 +277,10 @@ const buildCowSellTokenPermitHook = async (params: {
   owner: Address
   sellToken: CowSellToken
   amount: bigint
+  readonly onWalletProgress?: (progress: WalletProgress) => void
+  readonly signal?: AbortSignal
 }): Promise<CowHook | undefined> => {
+  params.signal?.throwIfAborted()
   if (params.sellToken.isNative) return undefined
   const spender = getAddress(COW_PROTOCOL_VAULT_RELAYER_ADDRESS[params.chainId])
   const config = permitConfigFor(params.publicClient)
@@ -285,6 +294,7 @@ const buildCowSellTokenPermitHook = async (params: {
       tokenAddress: params.sellToken.address,
       amount: params.amount,
     }).catch((error: unknown) => ({ error: String(error) })))
+  params.signal?.throwIfAborted()
   if ('error' in permitInfo || !isSupportedPermitInfo(permitInfo)) {
     return undefined
   }
@@ -301,6 +311,13 @@ const buildCowSellTokenPermitHook = async (params: {
   const nonce = params.walletClient
     ? await eip2612Utils.getTokenNonce(params.sellToken.address, params.owner)
     : undefined
+  params.signal?.throwIfAborted()
+  if (params.walletClient) {
+    params.onWalletProgress?.({
+      action: 'tokenPermit',
+      phase: 'awaitingSignature',
+    })
+  }
   const hook = await generatePermitHook({
     account: params.walletClient ? params.owner : undefined,
     amount: params.amount,
@@ -319,6 +336,9 @@ const buildCowSellTokenPermitHook = async (params: {
     throw new Error(
       `CoW could not prepare a gasless ${params.sellToken.symbol} permit.`,
     )
+  }
+  if (params.walletClient) {
+    params.onWalletProgress?.({ action: 'tokenPermit', phase: 'completed' })
   }
   return hook
     ? {
@@ -392,6 +412,7 @@ const tradeParameters = (params: {
   receiver: Address
   amountOut: bigint
   sellToken: CowSellToken
+  fixedValidTo?: number
 }) => ({
   chainId: params.chainId,
   appCode: APP_CODE,
@@ -403,7 +424,9 @@ const tradeParameters = (params: {
   buyTokenDecimals: USDC_DECIMALS,
   amount: params.amountOut.toString(),
   receiver: params.receiver,
-  validFor: ORDER_VALID_FOR_SECONDS,
+  ...(params.fixedValidTo === undefined
+    ? { validFor: ORDER_VALID_FOR_SECONDS }
+    : { validTo: params.fixedValidTo }),
   slippageBps: SLIPPAGE_BPS,
 })
 
@@ -456,6 +479,7 @@ export const quoteCowSwap = ResultFn(async function* (params: {
   readonly amountOut: bigint
   readonly sellToken: CowSellToken
   readonly hooks?: CowSwapHooks
+  readonly fixedValidTo?: number
 }) {
   const chainId = yield* asSupportedChain(params.chainId)
   const { sdk } = createCowClients({
@@ -468,6 +492,7 @@ export const quoteCowSwap = ResultFn(async function* (params: {
     receiver: params.receiver,
     amountOut: params.amountOut,
     sellToken: params.sellToken,
+    fixedValidTo: params.fixedValidTo,
   })
   const advancedSettings = advancedSettingsFor(params.hooks)
   const result = yield* fromPromise(
@@ -560,35 +585,57 @@ const ensureCowAllowance = async (params: {
   owner: Address
   sellToken: CowSellToken
   amount: bigint
+  readonly onWalletProgress?: (progress: WalletProgress) => void
+  readonly signal?: AbortSignal
 }) => {
   const allowance = await params.sdk.getCowProtocolAllowance({
     tokenAddress: params.sellToken.address,
     owner: params.owner,
   })
+  params.signal?.throwIfAborted()
   if (allowance >= params.amount) return
   if (
     allowance > 0n &&
     ZERO_FIRST_APPROVAL_SYMBOLS.has(params.sellToken.symbol.toUpperCase())
   ) {
+    params.onWalletProgress?.({
+      action: 'resetAllowance',
+      phase: 'awaitingSignature',
+    })
     const resetHash = await params.sdk.approveCowProtocol({
       tokenAddress: params.sellToken.address,
       amount: 0n,
+    })
+    params.onWalletProgress?.({
+      action: 'resetAllowance',
+      phase: 'awaitingConfirmation',
     })
     await waitForSuccessfulReceipt(
       params.publicClient,
       resetHash as Hash,
       `${params.sellToken.symbol} allowance reset failed on-chain.`,
     )
+    params.onWalletProgress?.({ action: 'resetAllowance', phase: 'completed' })
   }
+  params.signal?.throwIfAborted()
+  params.onWalletProgress?.({
+    action: 'tokenApproval',
+    phase: 'awaitingSignature',
+  })
   const approvalHash = await params.sdk.approveCowProtocol({
     tokenAddress: params.sellToken.address,
     amount: params.amount,
+  })
+  params.onWalletProgress?.({
+    action: 'tokenApproval',
+    phase: 'awaitingConfirmation',
   })
   await waitForSuccessfulReceipt(
     params.publicClient,
     approvalHash as Hash,
     `${params.sellToken.symbol} approval failed on-chain.`,
   )
+  params.onWalletProgress?.({ action: 'tokenApproval', phase: 'completed' })
 }
 
 /** Add CoW Swap's gasless sell-token permit when the current allowance is short. */
@@ -604,6 +651,8 @@ const prepareSellTokenAuthorization = async (params: {
   trade: ReturnType<typeof tradeParameters>
   hooks?: CowSwapHooks
   refreshed: QuoteResults
+  readonly onWalletProgress?: (progress: WalletProgress) => void
+  readonly signal?: AbortSignal
 }) => {
   const initialQuote = toQuote(params.amountOut, params.refreshed)
   if (params.sellToken.isNative) {
@@ -626,16 +675,19 @@ const prepareSellTokenAuthorization = async (params: {
       usesSellTokenPermit: false,
     }
   }
+  params.signal?.throwIfAborted()
   const permit = await buildCowSellTokenPermitHook({
     publicClient: params.publicClient,
     walletClient: params.walletClient,
     chainId: params.chainId,
     owner: params.owner,
     sellToken: params.sellToken,
-    // Cover the hard checkout ceiling so price movement cannot invalidate the
-    // permit between its signature and the CoW order signature.
+    // Keep the signed permit bounded across the hook and final quotes.
     amount: params.maximumSell,
+    signal: params.signal,
+    onWalletProgress: params.onWalletProgress,
   })
+  params.signal?.throwIfAborted()
   if (!permit) {
     return {
       activeHooks: params.hooks,
@@ -657,6 +709,124 @@ const prepareSellTokenAuthorization = async (params: {
   }
 }
 
+const sellTokenPermitMaximum = (params: {
+  readonly priceLimit?: 'checkoutMaximum' | 'latestQuote'
+  readonly initialMaximumSell: bigint
+  readonly maximumSell: bigint
+  readonly hardMaximumSell?: boolean
+}): bigint => {
+  if (params.priceLimit === 'latestQuote') {
+    return withBps(params.initialMaximumSell, PERMIT_HOOK_EXECUTION_RESERVE_BPS)
+  }
+  return params.hardMaximumSell
+    ? params.maximumSell
+    : withBps(params.maximumSell, PERMIT_HOOK_EXECUTION_RESERVE_BPS)
+}
+
+const cowAuthorizationLimits = (params: {
+  readonly priceLimit?: 'checkoutMaximum' | 'latestQuote'
+  readonly maximumSell: bigint
+  readonly permitMaximumSell: bigint
+  readonly usesSellTokenPermit: boolean
+}): {
+  readonly checkoutMaximumSell: bigint | undefined
+  readonly signedPermitMaximumSell: bigint | undefined
+} => {
+  if (params.priceLimit === 'latestQuote') {
+    return {
+      checkoutMaximumSell: undefined,
+      signedPermitMaximumSell: params.usesSellTokenPermit
+        ? params.permitMaximumSell
+        : undefined,
+    }
+  }
+  return {
+    checkoutMaximumSell: params.usesSellTokenPermit
+      ? params.permitMaximumSell
+      : params.maximumSell,
+    signedPermitMaximumSell: undefined,
+  }
+}
+
+const needsFinalCowAllowance = (
+  priceLimit: 'checkoutMaximum' | 'latestQuote' | undefined,
+  usesSellTokenPermit: boolean,
+  refreshedMaximumSell: bigint,
+  finalMaximumSell: bigint,
+): boolean =>
+  priceLimit === 'latestQuote' &&
+  !usesSellTokenPermit &&
+  finalMaximumSell > refreshedMaximumSell
+
+const exceedsCowPriceLimit = (
+  maximumSell: bigint,
+  limit: bigint | undefined,
+): boolean => limit !== undefined && maximumSell > limit
+
+const validateCowPermitAmount = (
+  maximumSell: bigint,
+  permitMaximumSell: bigint | undefined,
+): Result<void, EthSwapRejectedError> =>
+  exceedsCowPriceLimit(maximumSell, permitMaximumSell)
+    ? err(
+        new EthSwapRejectedError({
+          message:
+            'The quote exceeds the signed sell-token permit. Please quote again.',
+        }),
+      )
+    : ok(undefined)
+
+/** Reject an expiry that can settle after the authorized setup hook expires. */
+const validateCowExpiry = (
+  validTo: number,
+  fixedValidTo: number | undefined,
+): Result<void, EthSwapRejectedError> =>
+  fixedValidTo !== undefined && validTo > fixedValidTo
+    ? err(
+        new EthSwapRejectedError({
+          message:
+            'The CoW order expires after its signed registration hook. Quote again.',
+        }),
+      )
+    : ok(undefined)
+
+/** Stop before another wallet request when the caller cancelled the run. */
+const validateCowCancellation = (
+  isAborted: boolean,
+): Result<void, EthSwapRejectedError> =>
+  isAborted
+    ? err(
+        new EthSwapRejectedError({
+          message: 'The CoW payment was cancelled before submission.',
+        }),
+      )
+    : ok(undefined)
+
+/** Await durable storage before the SDK can sign and post an order. */
+const checkpointCowSubmission = ResultFn(async function* (params: {
+  readonly onBeforeOrderSubmission?: () => Promise<void>
+  readonly signal?: AbortSignal
+}) {
+  yield* validateCowCancellation(params.signal?.aborted === true)
+  if (params.onBeforeOrderSubmission) {
+    yield* fromPromise(
+      Promise.resolve().then(() => params.onBeforeOrderSubmission?.()),
+      (cause) =>
+        new CowSwapSubmissionError({
+          message: 'The CoW submission checkpoint could not be saved.',
+          cause,
+        }),
+    )
+  }
+  return validateCowCancellation(params.signal?.aborted === true).mapErr(
+    (cause) =>
+      new CowSwapSubmissionError({
+        message: cause.message,
+        cause,
+      }),
+  )
+})
+
 /** Refresh, price-check, authorize, sign, and post an exact-output CoW order. */
 export const submitCowSwap = ResultFn(async function* (params: {
   readonly publicClient: PublicClient
@@ -666,10 +836,22 @@ export const submitCowSwap = ResultFn(async function* (params: {
   readonly receiver: Address
   readonly amountOut: bigint
   readonly sellToken: CowSellToken
-  /** Hard consent/solvency ceiling checked immediately before submission. */
+  /** Checkout ceiling, unless priceLimit selects the latest quote. */
   readonly maximumSell: bigint
+  /** Keep checkout consent by default; latestQuote uses fresh wallet authorization. */
+  readonly priceLimit?: 'checkoutMaximum' | 'latestQuote'
   readonly hooks?: CowSwapHooks
+  /** Shed hooks bind the first order to this exact expiry. */
+  readonly fixedValidTo?: number
+  /** Under checkoutMaximum, do not expand consent for a sell-token permit hook. */
+  readonly hardMaximumSell?: boolean
+  /** Persist the submission checkpoint before the SDK signs and posts. */
+  readonly onBeforeOrderSubmission?: () => Promise<void>
+  readonly onOrderSent?: (order: CowSwapOrder) => Promise<void>
+  readonly onWalletProgress?: (progress: WalletProgress) => void
+  readonly signal?: AbortSignal
 }) {
+  yield* validateCowCancellation(params.signal?.aborted === true)
   const chainId = yield* asSupportedChain(params.chainId)
   const { orderBookApi, sdk } = createCowClients({
     publicClient: params.publicClient,
@@ -682,6 +864,7 @@ export const submitCowSwap = ResultFn(async function* (params: {
     receiver: params.receiver,
     amountOut: params.amountOut,
     sellToken: params.sellToken,
+    fixedValidTo: params.fixedValidTo,
   })
   const initialSettings = advancedSettingsFor(params.hooks)
   const initialRefresh = yield* fromPromise(
@@ -695,10 +878,13 @@ export const submitCowSwap = ResultFn(async function* (params: {
       }),
   )
   const initialQuote = toQuote(params.amountOut, initialRefresh)
+  yield* validateCowExpiry(initialQuote.validTo, params.fixedValidTo)
   // Check the market quote before requesting a permit. The permit hook has a
   // fixed execution cost that is not price movement and is bounded by the
   // amount the user signs separately below.
-  if (initialQuote.maximumSell > params.maximumSell) {
+  const checkoutMaximumSell =
+    params.priceLimit === 'latestQuote' ? undefined : params.maximumSell
+  if (exceedsCowPriceLimit(initialQuote.maximumSell, checkoutMaximumSell)) {
     return err(
       new EthSwapRejectedError({
         message:
@@ -706,10 +892,13 @@ export const submitCowSwap = ResultFn(async function* (params: {
       }),
     )
   }
-  const permitMaximumSell = withBps(
-    params.maximumSell,
-    PERMIT_HOOK_EXECUTION_RESERVE_BPS,
-  )
+  yield* validateCowCancellation(params.signal?.aborted === true)
+  const permitMaximumSell = sellTokenPermitMaximum({
+    priceLimit: params.priceLimit,
+    initialMaximumSell: initialQuote.maximumSell,
+    maximumSell: params.maximumSell,
+    hardMaximumSell: params.hardMaximumSell,
+  })
   const authorization = yield* fromPromise(
     prepareSellTokenAuthorization({
       sdk,
@@ -723,6 +912,8 @@ export const submitCowSwap = ResultFn(async function* (params: {
       trade,
       hooks: params.hooks,
       refreshed: initialRefresh,
+      signal: params.signal,
+      onWalletProgress: params.onWalletProgress,
     }),
     (cause) =>
       new EthSwapUnavailableError({
@@ -730,14 +921,28 @@ export const submitCowSwap = ResultFn(async function* (params: {
         cause,
       }),
   )
+  yield* validateCowCancellation(params.signal?.aborted === true)
   const { activeHooks, refreshed, refreshedQuote, usesSellTokenPermit } =
     authorization
   const advancedSettings = advancedSettingsFor(activeHooks)
-  const authorizationMaximumSell = usesSellTokenPermit
-    ? permitMaximumSell
-    : params.maximumSell
+  yield* validateCowExpiry(refreshedQuote.validTo, params.fixedValidTo)
+  const {
+    checkoutMaximumSell: authorizationMaximumSell,
+    signedPermitMaximumSell,
+  } = cowAuthorizationLimits({
+    priceLimit: params.priceLimit,
+    maximumSell: params.maximumSell,
+    permitMaximumSell,
+    usesSellTokenPermit,
+  })
+  yield* validateCowPermitAmount(
+    refreshedQuote.maximumSell,
+    signedPermitMaximumSell,
+  )
 
-  if (refreshedQuote.maximumSell > authorizationMaximumSell) {
+  if (
+    exceedsCowPriceLimit(refreshedQuote.maximumSell, authorizationMaximumSell)
+  ) {
     return err(
       new EthSwapRejectedError({
         message:
@@ -754,35 +959,74 @@ export const submitCowSwap = ResultFn(async function* (params: {
       }),
       refreshed.quoteResponse,
     )
+    yield* checkpointCowSubmission(params)
+    params.onWalletProgress?.({
+      action: 'nativePayment',
+      phase: 'awaitingSignature',
+    })
     const posted = yield* fromPromise(
-      postSellNativeCurrencyOrder(
-        orderBookApi,
-        refreshed.appDataInfo,
-        limitOrder,
+      Promise.resolve().then(() =>
+        postSellNativeCurrencyOrder(
+          orderBookApi,
+          refreshed.appDataInfo,
+          limitOrder,
+          {
+            networkCostsAmount: refreshed.quoteResponse.quote.feeAmount,
+            protocolFeeBps: refreshed.quoteResponse.protocolFeeBps
+              ? Number(refreshed.quoteResponse.protocolFeeBps)
+              : undefined,
+          },
+        ),
       ),
       (cause) =>
-        new EthSwapUnavailableError({
+        new CowSwapSubmissionError({
           message: 'The CoW Protocol ETH order could not be submitted.',
           cause,
         }),
     )
     if (!posted.txHash) {
       return err(
-        new EthSwapUnavailableError({
+        new CowSwapSubmissionError({
           message: 'The CoW Protocol ETH order has no transaction hash.',
         }),
       )
     }
-    return ok({
-      order: {
-        orderId: posted.orderId,
-        hash: posted.txHash as Hash,
-        validTo: posted.orderToSign.validTo,
-        kind: 'native',
-        amountOut: params.amountOut,
-      } satisfies CowSwapOrder,
-      quote: refreshedQuote,
+    params.onWalletProgress?.({
+      action: 'nativePayment',
+      phase: 'awaitingConfirmation',
     })
+    // EthFlow creates a SELL order even when the SDK retains the BUY quote kind.
+    const orderId = yield* fromPromise(
+      calculateUniqueOrderId(chainId, {
+        ...posted.orderToSign,
+        kind: OrderKind.SELL,
+      }),
+      (cause) =>
+        new CowSwapSubmissionError({
+          message:
+            'The submitted CoW ETH order ID could not be calculated. Do not submit another payment.',
+          cause,
+        }),
+    )
+    const order: CowSwapOrder = {
+      orderId,
+      hash: posted.txHash as Hash,
+      validTo: posted.orderToSign.validTo,
+      kind: 'native',
+      amountOut: params.amountOut,
+    }
+    if (params.onOrderSent) {
+      yield* fromPromise(
+        Promise.resolve().then(() => params.onOrderSent?.(order)),
+        (cause) =>
+          new CowSwapSubmissionError({
+            message:
+              'The submitted CoW order could not be saved. Do not submit another payment.',
+            cause,
+          }),
+      )
+    }
+    return ok({ order, quote: refreshedQuote })
   }
 
   if (!usesSellTokenPermit) {
@@ -793,6 +1037,8 @@ export const submitCowSwap = ResultFn(async function* (params: {
         owner: params.owner,
         sellToken: params.sellToken,
         amount: refreshedQuote.maximumSell,
+        signal: params.signal,
+        onWalletProgress: params.onWalletProgress,
       }),
       (cause) =>
         new EthSwapUnavailableError({
@@ -802,6 +1048,7 @@ export const submitCowSwap = ResultFn(async function* (params: {
     )
   }
 
+  yield* validateCowCancellation(params.signal?.aborted === true)
   // Approval/permit signing can take long enough for the quote to move, so
   // quote once more and bind the order signature to that exact app-data.
   const postable = yield* fromPromise(
@@ -815,7 +1062,9 @@ export const submitCowSwap = ResultFn(async function* (params: {
       }),
   )
   const quote = toQuote(params.amountOut, postable.quoteResults)
-  if (quote.maximumSell > authorizationMaximumSell) {
+  yield* validateCowExpiry(quote.validTo, params.fixedValidTo)
+  yield* validateCowPermitAmount(quote.maximumSell, signedPermitMaximumSell)
+  if (exceedsCowPriceLimit(quote.maximumSell, authorizationMaximumSell)) {
     return err(
       new EthSwapRejectedError({
         message:
@@ -823,26 +1072,77 @@ export const submitCowSwap = ResultFn(async function* (params: {
       }),
     )
   }
+  yield* validateCowCancellation(params.signal?.aborted === true)
+  if (
+    needsFinalCowAllowance(
+      params.priceLimit,
+      usesSellTokenPermit,
+      refreshedQuote.maximumSell,
+      quote.maximumSell,
+    )
+  ) {
+    yield* fromPromise(
+      ensureCowAllowance({
+        sdk,
+        publicClient: params.publicClient,
+        owner: params.owner,
+        sellToken: params.sellToken,
+        amount: quote.maximumSell,
+        signal: params.signal,
+        onWalletProgress: params.onWalletProgress,
+      }),
+      (cause) =>
+        new EthSwapUnavailableError({
+          message: `${params.sellToken.symbol} could not be approved for CoW Protocol.`,
+          cause,
+        }),
+    )
+  }
+  yield* checkpointCowSubmission(params)
   const posted = yield* fromPromise(
     // The quote already contains the exact hook app-data that the user is
     // signing. Re-applying the same override here is unnecessary and can make
     // the posted document diverge from the one that was quoted.
-    postable.postSwapOrderFromQuote(),
+    Promise.resolve().then(() =>
+      params.onWalletProgress
+        ? postable.postSwapOrderFromQuote(undefined, {
+            beforeOrderSign: () =>
+              params.onWalletProgress?.({
+                action: 'paymentOrder',
+                phase: 'awaitingSignature',
+              }),
+            afterOrderSign: () =>
+              params.onWalletProgress?.({
+                action: 'paymentOrder',
+                phase: 'completed',
+              }),
+          })
+        : postable.postSwapOrderFromQuote(),
+    ),
     (cause) =>
-      new EthSwapUnavailableError({
+      new CowSwapSubmissionError({
         message: `The CoW Protocol ${params.sellToken.symbol} order could not be signed or submitted.`,
         cause,
       }),
   )
-  return ok({
-    order: {
-      orderId: posted.orderId,
-      validTo: postable.quoteResults.orderToSign.validTo,
-      kind: 'erc20',
-      amountOut: params.amountOut,
-    } satisfies CowSwapOrder,
-    quote,
-  })
+  const order: CowSwapOrder = {
+    orderId: posted.orderId,
+    validTo: postable.quoteResults.orderToSign.validTo,
+    kind: 'erc20',
+    amountOut: params.amountOut,
+  }
+  if (params.onOrderSent) {
+    yield* fromPromise(
+      Promise.resolve().then(() => params.onOrderSent?.(order)),
+      (cause) =>
+        new CowSwapSubmissionError({
+          message:
+            'The submitted CoW order could not be saved. Do not submit another payment.',
+          cause,
+        }),
+    )
+  }
+  return ok({ order, quote })
 })
 
 /** Backwards-compatible native-ETH submit helper. */

@@ -1,7 +1,16 @@
 import { getDestinationContracts } from '@ens-apps/smart-account'
-import type { Address, Hash, Hex, PublicClient } from 'viem'
+import {
+  type Address,
+  createPublicClient,
+  createWalletClient,
+  custom,
+  type Hash,
+  type Hex,
+  type PublicClient,
+  zeroHash,
+} from 'viem'
 import { sepolia } from 'viem/chains'
-import { describe, expect, it, vi } from 'vitest'
+import { assert, describe, expect, it, vi } from 'vitest'
 import { createActor, fromPromise, waitFor } from 'xstate'
 import {
   CallsBundleTimeoutError,
@@ -12,6 +21,8 @@ import {
 import { transactionManager } from '../../providers/transactionManager'
 import type { L2FundingSource, Signer } from '../../types/signer.types'
 import type { TransactionRequest } from '../../types/transaction.types'
+import { prepareCowShedRegistration } from './registration.cow-shed'
+import type { CowShedProgress } from './registration.cow-shed.actors'
 import type { EthFunding, PendingEthSwap } from './registration.eth.actors'
 import {
   type HcaSessionEnableParams,
@@ -21,6 +32,13 @@ import {
   registrationMachine,
   type UnsettledL2Bridge,
 } from './registration.machine'
+import {
+  buildRegistrationRecord,
+  getResumeTarget,
+  parseRegistrationRecord,
+  serializeRegistrationRecord,
+} from './registration.persistence'
+import type { WalletProgress } from './registration.wallet-progress'
 
 const HCA = '0xaaaa000000000000000000000000000000000001' as Address
 const WALLET = '0x1111111111111111111111111111111111111111' as Address
@@ -28,6 +46,554 @@ const BUDGET = 15_000_000n
 const RESOLVER = '0xbbbb000000000000000000000000000000000002' as Address
 const COMMITMENT = `0x${'ab'.repeat(32)}` as Hash
 const SECRET = `0x${'cd'.repeat(32)}` as Hex
+
+it('refuses a resumed Shed run without durable storage before it requests a wallet action', async () => {
+  const actor = createActor(registrationMachine, {
+    input: { chainId: sepolia.id },
+  })
+  const crash = vi.fn()
+  actor.subscribe({ error: crash })
+  actor.start()
+  actor.send({
+    type: 'RESUME',
+    stage: 'runningCowShedRegistration',
+    context: {
+      chainId: sepolia.id,
+      name: 'example.eth',
+      duration: 31_536_000n,
+      selectedToken: 'USDC',
+      tokenPrice: 8_000_000n,
+      signerType: 'eoa',
+      accountAddress: WALLET,
+      ownerAddress: WALLET,
+      resolverAddress: RESOLVER,
+      commitment: { commitment: COMMITMENT, secret: SECRET },
+      ethFunding: {
+        displayedCharge: 10n ** 16n,
+        cowShed: {
+          executionBudget: 100_000n,
+          firstOrderValidTo: 1_800_000_000,
+        },
+      },
+    },
+    deps: {
+      signer: { type: 'eoa' } as Signer,
+      publicClient: { chain: sepolia } as PublicClient,
+    },
+  })
+  await waitFor(actor, (snapshot) => snapshot.matches('error'))
+  expect(crash).not.toHaveBeenCalled()
+  expect(actor.getSnapshot().value).toBe('error')
+  expect(actor.getSnapshot().context.error?.message).toContain(
+    'durable storage',
+  )
+  actor.stop()
+})
+
+describe('registrationMachine Shed progress ownership', () => {
+  const authorization = {
+    chainId: sepolia.id,
+    wallet: WALLET,
+    resolver: RESOLVER,
+    name: 'example.eth',
+    duration: 31_536_000n,
+    secret: SECRET,
+    commitment: COMMITMENT,
+    registrationPrice: 8_000_000n,
+    executionBudget: 100_000n,
+    firstOrderValidTo: 1_800_000_000n,
+    secondOrderValidTo: 1_800_003_600n,
+    salt: COMMITMENT,
+    setupNonce: COMMITMENT,
+    registrationNonce: COMMITMENT,
+  }
+  const hook = { target: WALLET, callData: '0x', gasLimit: 1_000_000 } as const
+  const progress: CowShedProgress = {
+    stage: 'prepared',
+    plan: {
+      authorization,
+      signed: {
+        cowShedAccount: WALLET,
+        ...prepareCowShedRegistration({
+          ...authorization,
+          appDataHash: COMMITMENT,
+        }),
+        registrationAppData: { appDataHex: COMMITMENT, appDataContent: '{}' },
+        registrationHook: hook,
+        setupHook: hook,
+      },
+      sellToken: {
+        address: WALLET,
+        symbol: 'TEST',
+        decimals: 18,
+        isNative: false,
+      },
+      maximumSell: 10n ** 16n,
+    },
+  }
+
+  it.each(['retry', 'reload'] as const)(
+    'rechecks a settled Shed registration after verification fails on %s without another purchase',
+    async (recovery) => {
+      const settled: CowShedProgress = {
+        stage: 'settled',
+        orderId: 'registration-order',
+        plan: {
+          ...progress.plan,
+          authorization: { ...authorization, referrer: zeroHash },
+          signed: {
+            cowShedAccount: progress.plan.signed.cowShedAccount,
+            firstOrderAmountOut: progress.plan.signed.firstOrderAmountOut,
+            conditionalOrder: progress.plan.signed.conditionalOrder,
+            registrationAppData: progress.plan.signed.registrationAppData,
+            registrationHook: hook,
+            setupHook: hook,
+          },
+          funding: {
+            orderId: 'funding-order',
+            validTo: Number(authorization.firstOrderValidTo),
+            kind: 'erc20',
+          },
+        },
+      }
+      const walletRequest = vi.fn(async () => {
+        throw new Error('Unexpected wallet request')
+      })
+      const rpcRequest = vi.fn(async () => {
+        throw new Error('Unexpected payment or order read')
+      })
+      const publicClient = createPublicClient({
+        chain: sepolia,
+        transport: custom({ request: rpcRequest }),
+      })
+      const signer: Signer = {
+        type: 'eoa',
+        walletClient: createWalletClient({
+          account: WALLET,
+          chain: sepolia,
+          transport: custom({ request: walletRequest }),
+        }),
+      }
+      const fetch = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(new Error('Unexpected orderbook request'))
+      const verifyRegistration = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Registry read failed'))
+        .mockResolvedValue({
+          verified: true,
+          registeredToOther: false,
+          isUnregistered: false,
+        })
+      const machine = registrationMachine.provide({
+        actors: { verifyRegistration: fromPromise(verifyRegistration) },
+      })
+      const makeActor = () =>
+        createActor(machine, { input: { chainId: sepolia.id } })
+      const actor = makeActor()
+      const persistCowShedProgress = vi.fn(async () => {})
+      const deps = { signer, publicClient, persistCowShedProgress }
+      actor.start()
+      try {
+        actor.send({
+          type: 'RESUME',
+          stage: 'runningCowShedRegistration',
+          context: {
+            chainId: sepolia.id,
+            name: authorization.name,
+            duration: authorization.duration,
+            selectedToken: 'USDC',
+            tokenPrice: authorization.registrationPrice,
+            signerType: 'eoa',
+            accountAddress: WALLET,
+            ownerAddress: WALLET,
+            resolverAddress: RESOLVER,
+            commitment: { commitment: COMMITMENT, secret: SECRET },
+            cowShedRun: settled,
+            ethFunding: {
+              displayedCharge: settled.plan.maximumSell,
+              sellToken: settled.plan.sellToken,
+              cowShed: {
+                executionBudget: authorization.executionBudget,
+                firstOrderValidTo: Number(authorization.firstOrderValidTo),
+              },
+            },
+          },
+          deps,
+        })
+        await waitFor(actor, (snapshot) => snapshot.matches('error'))
+        expect(verifyRegistration).toHaveBeenCalledOnce()
+
+        const resume = () => {
+          if (recovery === 'retry') {
+            actor.send({ type: 'RETRY' })
+            return actor
+          }
+          const parsed = parseRegistrationRecord(
+            serializeRegistrationRecord(
+              buildRegistrationRecord('error', actor.getSnapshot().context, 1),
+            ),
+          )
+          if (parsed.isErr()) throw parsed.error
+          actor.stop()
+          const restored = makeActor()
+          restored.start()
+          restored.send({
+            type: 'RESUME',
+            stage: getResumeTarget(parsed.value),
+            context: parsed.value.context,
+            deps,
+          })
+          return restored
+        }
+        const resumed = resume()
+        try {
+          await waitFor(resumed, (snapshot) => snapshot.matches('success'))
+          expect(verifyRegistration).toHaveBeenCalledTimes(2)
+          expect(resumed.getSnapshot().context.cowShedRun).toEqual(settled)
+          expect(walletRequest).not.toHaveBeenCalled()
+          expect(rpcRequest).not.toHaveBeenCalled()
+          expect(fetch).not.toHaveBeenCalled()
+          expect(persistCowShedProgress).not.toHaveBeenCalled()
+        } finally {
+          resumed.stop()
+        }
+      } finally {
+        actor.stop()
+        fetch.mockRestore()
+      }
+    },
+  )
+
+  it('starts a newly confirmed checkout without the failed prepared plan', async () => {
+    const actor = createActor(
+      registrationMachine.provide({
+        actors: {
+          runCowShedRegistration: fromPromise(async () => {
+            throw new Error('Quote changed before submission')
+          }),
+          checkResolverDeployment: fromPromise(
+            () => new Promise<never>(() => {}),
+          ),
+        },
+      }),
+      { input: { chainId: sepolia.id } },
+    )
+    const signer = { type: 'eoa' } as Signer
+    const publicClient = { chain: sepolia } as PublicClient
+    actor.start()
+    actor.send({
+      type: 'RESUME',
+      stage: 'runningCowShedRegistration',
+      context: {
+        chainId: sepolia.id,
+        name: authorization.name,
+        duration: authorization.duration,
+        selectedToken: 'USDC',
+        tokenPrice: authorization.registrationPrice,
+        signerType: 'eoa',
+        accountAddress: WALLET,
+        ownerAddress: WALLET,
+        resolverAddress: RESOLVER,
+        commitment: { commitment: COMMITMENT, secret: SECRET },
+        cowShedRun: progress,
+      },
+      deps: {
+        signer,
+        publicClient,
+        persistCowShedProgress: async () => {},
+      },
+    })
+    await waitFor(actor, (snapshot) => snapshot.matches('error'))
+    actor.send({ type: 'CANCEL' })
+    actor.send({
+      type: 'START_REGISTRATION',
+      name: authorization.name,
+      duration: authorization.duration,
+      token: 'USDC',
+      price: 9_000_000n,
+      signer,
+      publicClient,
+      accountAddress: WALLET,
+      ethFunding: {
+        displayedCharge: 2n * 10n ** 16n,
+        cowShed: {
+          executionBudget: 200_000n,
+          firstOrderValidTo: 1_800_000_300,
+        },
+      },
+      persistCowShedProgress: async () => {},
+    })
+    expect(actor.getSnapshot().value).toBe('checkingResolver')
+    expect(actor.getSnapshot().context.cowShedRun).toBeUndefined()
+    expect(actor.getSnapshot().context.ethFunding?.displayedCharge).toBe(
+      2n * 10n ** 16n,
+    )
+    expect(actor.getSnapshot().context.tokenPrice).toBe(9_000_000n)
+    actor.stop()
+  })
+
+  it.each([
+    { state: 'runningCowShedRegistration', recovery: 'resume' },
+    { state: 'runningCowShedRegistration', recovery: 'retry' },
+    { state: 'swappingEth', recovery: 'resume' },
+    { state: 'swappingEth', recovery: 'retry' },
+  ] as const)(
+    'owns transient wallet evidence only for the active $state invocation after $recovery',
+    async ({ state, recovery }) => {
+      const callbacks: ((progress: WalletProgress) => void)[] = []
+      const failures: ((cause: unknown) => void)[] = []
+      const capture = fromPromise(
+        ({
+          input,
+        }: {
+          input: {
+            readonly onWalletProgress?: (progress: WalletProgress) => void
+          }
+        }) => {
+          if (input.onWalletProgress) callbacks.push(input.onWalletProgress)
+          return new Promise<never>((_resolve, reject) => failures.push(reject))
+        },
+      )
+      const actor = createActor(
+        registrationMachine.provide({
+          actors: { runCowShedRegistration: capture, swapEthForUsdc: capture },
+        }),
+        { input: { chainId: sepolia.id } },
+      )
+      const resume = () =>
+        actor.send({
+          type: 'RESUME',
+          stage: state,
+          context: {
+            chainId: sepolia.id,
+            name: 'example.eth',
+            duration: authorization.duration,
+            selectedToken: 'USDC',
+            tokenPrice: authorization.registrationPrice,
+            signerType: 'eoa',
+            accountAddress: WALLET,
+            resolverAddress: RESOLVER,
+            commitment: { commitment: COMMITMENT, secret: SECRET },
+            ...(state === 'runningCowShedRegistration'
+              ? { cowShedRun: progress }
+              : {
+                  cowCommitHookPending: true,
+                  pendingEthSwap: {
+                    kind: 'erc20' as const,
+                    orderId: 'funding-order',
+                    validTo: 1_800_000_000,
+                  },
+                }),
+            ethFunding: { displayedCharge: 10n ** 16n },
+          },
+          deps: {
+            signer: { type: 'eoa' } as Signer,
+            publicClient: { chain: sepolia } as PublicClient,
+          },
+        })
+      actor.start()
+      resume()
+      await waitFor(actor, (snapshot) => snapshot.matches(state))
+      const first = callbacks[0]
+      assert(first)
+      first({ action: 'tokenApproval', phase: 'completed' })
+      expect(actor.getSnapshot().context.walletProgress).toEqual({
+        current: undefined,
+        completed: ['tokenApproval'],
+      })
+      if (recovery === 'resume') {
+        actor.send({ type: 'SUSPEND' })
+      } else {
+        const fail = failures[0]
+        assert(fail)
+        fail(new Error('Wallet request failed'))
+        await waitFor(actor, (snapshot) => snapshot.matches('error'))
+      }
+      expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
+      if (recovery === 'resume') resume()
+      else actor.send({ type: 'RETRY' })
+      await waitFor(actor, (snapshot) => snapshot.matches(state))
+      first({ action: 'tokenPermit', phase: 'completed' })
+      expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
+      callbacks[1]?.({ action: 'paymentOrder', phase: 'awaitingSignature' })
+      expect(actor.getSnapshot().context.walletProgress).toEqual({
+        current: { action: 'paymentOrder', phase: 'awaitingSignature' },
+        completed: [],
+      })
+      actor.send({ type: 'CANCEL' })
+      callbacks[1]?.({ action: 'paymentOrder', phase: 'completed' })
+      expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
+      actor.stop()
+    },
+  )
+
+  it.each(['CANCEL', 'SUSPEND'] as const)(
+    'does not apply an old save after %s and a replacement invocation',
+    async (type) => {
+      let completeSave = () => {}
+      const saved = new Promise<void>((resolve) => {
+        completeSave = resolve
+      })
+      const callbacks: ((progress: CowShedProgress) => Promise<void>)[] = []
+      const actor = createActor(
+        registrationMachine.provide({
+          actors: {
+            runCowShedRegistration: fromPromise(
+              ({
+                input,
+              }: {
+                input: {
+                  readonly onProgress: (
+                    progress: CowShedProgress,
+                  ) => Promise<void>
+                }
+              }) => {
+                callbacks.push(input.onProgress)
+                return new Promise<never>(() => {})
+              },
+            ),
+          },
+        }),
+        { input: { chainId: sepolia.id } },
+      )
+      const persistCowShedProgress = vi.fn(() => saved)
+      const resume = () =>
+        actor.send({
+          type: 'RESUME',
+          stage: 'runningCowShedRegistration',
+          context: {
+            chainId: sepolia.id,
+            name: 'example.eth',
+            duration: authorization.duration,
+            selectedToken: 'USDC',
+            tokenPrice: authorization.registrationPrice,
+            signerType: 'eoa',
+            accountAddress: WALLET,
+            resolverAddress: RESOLVER,
+            commitment: { commitment: COMMITMENT, secret: SECRET },
+            ethFunding: {
+              displayedCharge: 10n ** 16n,
+              cowShed: {
+                executionBudget: 100_000n,
+                firstOrderValidTo: 1_800_000_000,
+              },
+            },
+          },
+          deps: {
+            signer: { type: 'eoa' } as Signer,
+            publicClient: { chain: sepolia } as PublicClient,
+            persistCowShedProgress,
+          },
+        })
+      actor.start()
+      resume()
+      const firstCallback = callbacks[0]
+      if (!firstCallback) throw new Error('Missing first invocation')
+      const pending = firstCallback(progress)
+      expect(persistCowShedProgress).toHaveBeenCalledWith(progress)
+      expect(actor.getSnapshot().context.cowShedRun).toBeUndefined()
+      actor.send({ type })
+      resume()
+      completeSave()
+      await pending
+      expect(actor.getSnapshot().context.cowShedRun).toBeUndefined()
+      const currentCallback = callbacks[1]
+      if (!currentCallback) throw new Error('Missing replacement invocation')
+      await currentCallback(progress)
+      expect(actor.getSnapshot().context.cowShedRun).toEqual(progress)
+      actor.send({ type })
+      await currentCallback({ ...progress, stage: 'settled' })
+      expect(actor.getSnapshot().context.cowShedRun?.stage).toBe('prepared')
+      actor.stop()
+    },
+  )
+})
+
+describe('registrationMachine verification deployment', () => {
+  it.each([
+    { route: 'Sepolia EOA', chainId: sepolia.id, type: 'eoa', isShed: false },
+    { route: 'Sepolia Shed', chainId: sepolia.id, type: 'eoa', isShed: true },
+    {
+      route: 'Sepolia HCA',
+      chainId: sepolia.id,
+      type: 'rhinestone',
+      isShed: false,
+    },
+    { route: 'mainnet EOA', chainId: 1, type: 'eoa', isShed: false },
+  ] as const)(
+    'uses the correct deployment for $route',
+    async ({ chainId, type, isShed }) => {
+      const verifyRegistration = vi.fn(
+        (_: {
+          input: {
+            readonly registrarAddress?: Address
+            readonly registryAddress?: Address
+            readonly mode: string
+          }
+        }) => new Promise<never>(() => {}),
+      )
+      const actor = createActor(
+        registrationMachine.provide({
+          actors: {
+            verifyRegistration: fromPromise(verifyRegistration),
+            runCowShedRegistration: fromPromise(async () => undefined),
+          },
+        }),
+        { input: { chainId } },
+      )
+      actor.start()
+      actor.send({
+        type: 'RESUME',
+        stage: isShed ? 'runningCowShedRegistration' : 'verifyingRegistration',
+        context: {
+          chainId,
+          name: 'example.eth',
+          duration: 31_536_000n,
+          selectedToken: 'USDC',
+          tokenPrice: 8_000_000n,
+          signerType: type,
+          accountAddress: WALLET,
+          ownerAddress: WALLET,
+          resolverAddress: RESOLVER,
+          commitment: { commitment: COMMITMENT, secret: SECRET },
+          ...(isShed
+            ? {
+                ethFunding: {
+                  displayedCharge: 10n ** 16n,
+                  cowShed: {
+                    executionBudget: 100_000n,
+                    firstOrderValidTo: 1_800_000_000,
+                  },
+                },
+              }
+            : {}),
+        },
+        deps: {
+          signer: { type } as Signer,
+          publicClient: { chain: { id: chainId } } as PublicClient,
+        },
+      })
+      await waitFor(actor, (snapshot) =>
+        snapshot.matches('verifyingRegistration'),
+      )
+      expect(verifyRegistration).toHaveBeenCalledOnce()
+      const input = verifyRegistration.mock.calls[0]?.[0].input
+      expect(input?.mode).toBe(
+        type === 'rhinestone' ? 'hca' : isShed ? 'cowShed' : 'eoa',
+      )
+      const contracts = getDestinationContracts(sepolia.id)
+      const usesManifest = chainId === sepolia.id && type === 'eoa'
+      expect(input?.registrarAddress).toBe(
+        usesManifest ? contracts.ethRegistrar : undefined,
+      )
+      expect(input?.registryAddress).toBe(
+        usesManifest ? contracts.ethRegistry : undefined,
+      )
+      actor.stop()
+    },
+  )
+})
 
 const permit = {
   owner: WALLET,

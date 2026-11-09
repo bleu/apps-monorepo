@@ -91,6 +91,10 @@ export {
   VERIFY_POLL_INTERVAL_MS,
 } from './machines/registration/registration.actors'
 export {
+  type CowShedProgress,
+  quoteCowShedPaymentActor,
+} from './machines/registration/registration.cow-shed.actors'
+export {
   ETH_SWAP_GAS_RESERVE_MULTIPLIER,
   type EthFunding,
   type EthPaymentQuote,
@@ -131,6 +135,11 @@ export type {
   RegistrationMachineEvent,
   RegistrationMachineState,
 } from './machines/registration/registration.types'
+export type {
+  RegistrationWalletProgress,
+  WalletAction,
+  WalletProgress,
+} from './machines/registration/registration.wallet-progress'
 // Machines
 export { transactionMachine } from './machines/transaction.machine'
 export type {

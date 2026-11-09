@@ -19,6 +19,7 @@
   "dependencies": {
     "@cowprotocol/cow-sdk": "catalog:",
     "@cowprotocol/permit-utils": "catalog:",
+    "@cowprotocol/sdk-cow-shed": "0.6.5",
     "@cowprotocol/sdk-viem-adapter": "catalog:",
     "@ens-apps/config": "workspace:*",
     "@ens-apps/smart-account": "workspace:*",
