@@ -3,6 +3,7 @@ import { registrationMachine } from '@ens-apps/transaction-manager'
 import { i18n } from '@lingui/core'
 import { I18nProvider } from '@lingui/react'
 import { act, render, screen } from '@testing-library/react'
+import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createActor } from 'xstate'
 import { useRegistrationFillProgress } from '@/features/weave-registration/lib/useRegistrationFillProgress'
@@ -40,6 +41,28 @@ afterEach(() => {
 })
 i18n.loadAndActivate({ locale: 'en', messages: {} })
 
+const setupRegistration = (chainId: number) => {
+  const uiActor = createActor(registrationV2UiMachine, { input: { chainId } })
+  const registrationActor = createActor(registrationMachine, {
+    input: { chainId },
+  })
+  const uiSnapshot = uiActor.getSnapshot()
+  const txSnapshot = registrationActor.getSnapshot()
+  const readUi = vi.spyOn(uiActor, 'getSnapshot')
+  const readTx = vi.spyOn(registrationActor, 'getSnapshot')
+  vi.spyOn(RegisterV2Context, 'use').mockReturnValue({
+    uiActor,
+    registrationActor,
+    label: 'name-two',
+    resume: { status: 'idle' },
+  })
+  return { uiSnapshot, txSnapshot, readUi, readTx }
+}
+
+const I18nWrapper = ({ children }: { readonly children: ReactNode }) => (
+  <I18nProvider i18n={i18n}>{children}</I18nProvider>
+)
+
 const RegisteringProgress = () => {
   const progress = useRegistrationFillProgress(true, 0)
   return (
@@ -58,14 +81,9 @@ describe('RegisteringStep', () => {
   it('paces the route fill from the live CoW stage', async () => {
     vi.useFakeTimers()
     const plan = await makePlan()
-    const uiActor = createActor(registrationV2UiMachine, {
-      input: { chainId: 11155111 },
-    })
-    const registrationActor = createActor(registrationMachine, {
-      input: { chainId: 11155111 },
-    })
-    const uiSnapshot = uiActor.getSnapshot()
-    const readUi = vi.spyOn(uiActor, 'getSnapshot').mockReturnValue({
+    const { uiSnapshot, txSnapshot, readUi, readTx } =
+      setupRegistration(11155111)
+    readUi.mockReturnValue({
       ...uiSnapshot,
       value: {
         registering: {
@@ -81,8 +99,7 @@ describe('RegisteringStep', () => {
         },
       },
     })
-    const txSnapshot = registrationActor.getSnapshot()
-    const readTx = vi.spyOn(registrationActor, 'getSnapshot').mockReturnValue({
+    readTx.mockReturnValue({
       ...txSnapshot,
       value: 'runningCowShedRegistration',
       context: {
@@ -98,17 +115,7 @@ describe('RegisteringStep', () => {
         },
       },
     })
-    vi.spyOn(RegisterV2Context, 'use').mockReturnValue({
-      uiActor,
-      registrationActor,
-      label: 'name-two',
-      resume: { status: 'idle' },
-    })
-    const view = render(
-      <I18nProvider i18n={i18n}>
-        <RegisteringProgress />
-      </I18nProvider>,
-    )
+    const view = render(<RegisteringProgress />, { wrapper: I18nWrapper })
     await act(() => vi.advanceTimersByTimeAsync(90_000))
 
     expect(Number(screen.getByLabelText('Fill progress').textContent)).toBe(30)
@@ -122,11 +129,7 @@ describe('RegisteringStep', () => {
         cowShedRun: { stage: 'settled', plan },
       },
     })
-    view.rerender(
-      <I18nProvider i18n={i18n}>
-        <RegisteringProgress />
-      </I18nProvider>,
-    )
+    view.rerender(<RegisteringProgress />)
     await act(() => vi.advanceTimersByTimeAsync(10_000))
     expect(
       Number(screen.getByLabelText('Fill progress').textContent),
@@ -136,11 +139,7 @@ describe('RegisteringStep', () => {
     ).not.toBeInTheDocument()
 
     readUi.mockReturnValue({ ...uiSnapshot, value: 'success' })
-    view.rerender(
-      <I18nProvider i18n={i18n}>
-        <RegisteringProgress />
-      </I18nProvider>,
-    )
+    view.rerender(<RegisteringProgress />)
     await act(() => vi.advanceTimersByTimeAsync(1_000))
     expect(Number(screen.getByLabelText('Fill progress').textContent)).toBe(100)
   })
@@ -149,21 +148,14 @@ describe('RegisteringStep', () => {
     'shows linked live progress when notifications are %s',
     async (notifications) => {
       const plan = await makePlan()
-      const uiActor = createActor(registrationV2UiMachine, {
-        input: { chainId: 1 },
-      })
-      const registrationActor = createActor(registrationMachine, {
-        input: { chainId: 1 },
-      })
-      const uiSnapshot = uiActor.getSnapshot()
-      vi.spyOn(uiActor, 'getSnapshot').mockReturnValue({
+      const { uiSnapshot, txSnapshot, readUi, readTx } = setupRegistration(1)
+      readUi.mockReturnValue({
         ...uiSnapshot,
         value: {
           registering: { notifications, transaction: 'pendingRegistration' },
         },
       })
-      const txSnapshot = registrationActor.getSnapshot()
-      vi.spyOn(registrationActor, 'getSnapshot').mockReturnValue({
+      readTx.mockReturnValue({
         ...txSnapshot,
         value: 'runningCowShedRegistration',
         context: {
@@ -171,20 +163,13 @@ describe('RegisteringStep', () => {
           cowShedRun: { stage: 'revealSent', plan, orderId: 'live-order' },
         },
       })
-      vi.spyOn(RegisterV2Context, 'use').mockReturnValue({
-        uiActor,
-        registrationActor,
-        label: 'name-two',
-        resume: { status: 'idle' },
-      })
       render(
-        <I18nProvider i18n={i18n}>
-          <RegisteringStep
-            fillDone={false}
-            fillProgress={60}
-            isRegistrationComplete={false}
-          />
-        </I18nProvider>,
+        <RegisteringStep
+          fillDone={false}
+          fillProgress={60}
+          isRegistrationComplete={false}
+        />,
+        { wrapper: I18nWrapper },
       )
       expect(
         screen.getByRole('list', { name: 'Registration progress' }),

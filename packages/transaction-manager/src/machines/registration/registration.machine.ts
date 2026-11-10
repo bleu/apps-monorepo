@@ -389,8 +389,6 @@ export type RegistrationContext = {
   readonly walletProgress?: RegistrationWalletProgress
   readonly walletProgressInvocation?: number
   readonly cowShedRun?: CowShedProgress
-  /** Runtime generation; each Shed invocation owns only its own progress. */
-  readonly cowShedInvocation?: number
   readonly persistCowShedProgress?: (progress: CowShedProgress) => Promise<void>
   /**
    * The EthFlow order, from on-chain creation until CoW settlement.
@@ -1865,14 +1863,7 @@ export const registrationMachine = setup({
 
     runningCowShedRegistration: {
       exit: 'clearWalletProgress',
-      entry: [
-        'logTransition',
-        'beginWalletProgress',
-        assign({
-          cowShedInvocation: ({ context }) =>
-            (context.cowShedInvocation ?? 0) + 1,
-        }),
-      ],
+      entry: ['logTransition', 'beginWalletProgress'],
       invoke: {
         src: 'runCowShedRegistration',
         input: ({ context, self }) => ({
@@ -1889,7 +1880,8 @@ export const registrationMachine = setup({
             const current = self.getSnapshot()
             if (
               current.matches('runningCowShedRegistration') &&
-              current.context.cowShedInvocation === context.cowShedInvocation
+              current.context.walletProgressInvocation ===
+                context.walletProgressInvocation
             ) {
               self.send({ type: 'COW_SHED_PROGRESS', progress })
             }

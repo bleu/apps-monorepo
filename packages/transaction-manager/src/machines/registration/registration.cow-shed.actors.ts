@@ -391,12 +391,9 @@ const pollOrder = ResultFn(async function* (
   const orderBook = createRegistrationOrderBook()
   while (true) {
     yield* checkAbort(input)
-    const response = yield* fromPromise(
-      orderBook.getOrder(orderId).then(
-        (order) => ok(order),
-        (cause: unknown) => err(cause),
-      ),
-      (cause) => recoveryError(shed, cause),
+    const response = await fromPromise(
+      orderBook.getOrder(orderId),
+      (cause) => cause,
     )
     yield* checkAbort(input)
     const status = response.isOk() ? response.value.status : undefined
@@ -639,12 +636,9 @@ const sendRevealRequest = ResultFn(async function* (input: {
   readonly orderId: string
   readonly shed: Address
 }) {
-  const posted = yield* fromPromise(
-    input.api.sendOrder(input.request).then(
-      (id) => ok(id),
-      (cause: unknown) => err(cause),
-    ),
-    (cause) => recoveryError(input.shed, cause),
+  const posted = await fromPromise(
+    input.api.sendOrder(input.request),
+    (cause) => cause,
   )
   if (posted.isErr()) {
     return hasOrderBookErrorType(posted.error, 'DuplicatedOrder')
@@ -692,13 +686,7 @@ const recoverPublication = ResultFn(async function* (
   const shed = plan.signed.cowShedAccount
   const recover = (cause: unknown) => recoveryError(shed, cause)
   const api = createRegistrationOrderBook()
-  const known = yield* fromPromise(
-    api.getOrder(orderId).then(
-      (order) => ok(order),
-      (cause: unknown) => err(cause),
-    ),
-    recover,
-  )
+  const known = await fromPromise(api.getOrder(orderId), (cause) => cause)
   if (known.isOk()) return ok(known.value.status === OrderStatus.FULFILLED)
   if (
     !(known.error instanceof OrderBookApiError) ||

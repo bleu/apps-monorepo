@@ -25,7 +25,7 @@ import {
   zeroAddress,
 } from 'viem'
 import { sepolia } from 'viem/chains'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const realOrderBook = vi.hoisted(() => ({ enabled: false }))
 const getOrder = vi.fn()
@@ -81,6 +81,12 @@ beforeEach(() => {
   getCowProtocolAllowance.mockResolvedValue(10n ** 30n)
   getQuoteOnly.mockRejectedValue(new Error('Unexpected quote request'))
   uploadAppData.mockResolvedValue({})
+})
+
+afterEach(() => {
+  realOrderBook.enabled = false
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 import { NATIVE_ETH } from '../../helpers/eth-usdc-swap'
@@ -247,6 +253,15 @@ const mockReadiness = (
     })
 }
 
+const expectNoCalls = (...mocks: readonly unknown[]) => {
+  for (const mock of mocks) expect(mock).not.toHaveBeenCalled()
+}
+
+const mockSettledOrders = () => {
+  getOrder.mockResolvedValue({ status: 'fulfilled' })
+  sendOrder.mockImplementation(async (request) => getCowShedOrderUid(request))
+}
+
 describe('CoW Shed checkout', () => {
   it.each([
     { maxFeePerGas: 20n, executionBudget: 1_000_000n, usdcToBuy: 6_000_000n },
@@ -330,10 +345,7 @@ describe('CoW Shed registration recovery', () => {
         .spyOn(input.publicClient, 'getTransactionReceipt')
         .mockReturnValue(receipt.promise)
       mockReadiness(input, true)
-      getOrder.mockResolvedValue({ status: 'fulfilled' })
-      sendOrder.mockImplementation(async (request) =>
-        getCowShedOrderUid(request),
-      )
+      mockSettledOrders()
       const pending = runCowShedRegistrationActor({
         ...input,
         sellToken: NATIVE_ETH,
@@ -366,8 +378,7 @@ describe('CoW Shed registration recovery', () => {
       >)
     const sign = vi.spyOn(input.walletClient, 'signTypedData')
     const send = vi.spyOn(input.walletClient, 'sendTransaction')
-    getOrder.mockResolvedValue({ status: 'fulfilled' })
-    sendOrder.mockImplementation(async (request) => getCowShedOrderUid(request))
+    mockSettledOrders()
 
     const result = await runCowShedRegistrationActor({
       ...input,
@@ -391,10 +402,7 @@ describe('CoW Shed registration recovery', () => {
       expect(saved.plan.funding).toBe(progress.funding)
       expect(saved.plan.signed).toBe(progress.plan.signed)
     }
-    expect(sign).not.toHaveBeenCalled()
-    expect(send).not.toHaveBeenCalled()
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(sign, send, getQuoteOnly, postSwapOrderFromQuote)
   })
 
   it('reports a failed saved ETH creation transaction without polling or purchasing again', async () => {
@@ -404,8 +412,7 @@ describe('CoW Shed registration recovery', () => {
       status: 'reverted',
     } as Awaited<ReturnType<typeof input.publicClient.getTransactionReceipt>>)
     mockReadiness(input, true)
-    getOrder.mockResolvedValue({ status: 'fulfilled' })
-    sendOrder.mockImplementation(async (request) => getCowShedOrderUid(request))
+    mockSettledOrders()
     const send = vi.spyOn(input.walletClient, 'sendTransaction')
 
     const result = await runCowShedRegistrationActor({
@@ -421,12 +428,14 @@ describe('CoW Shed registration recovery', () => {
         message: expect.stringContaining('No new purchase will be made.'),
       },
     })
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(getOrder).not.toHaveBeenCalled()
-    expect(sendOrder).not.toHaveBeenCalled()
-    expect(send).not.toHaveBeenCalled()
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(
+      input.onProgress,
+      getOrder,
+      sendOrder,
+      send,
+      getQuoteOnly,
+      postSwapOrderFromQuote,
+    )
   })
 
   it.each([
@@ -439,45 +448,35 @@ describe('CoW Shed registration recovery', () => {
     'retries a saved native creation %s before polling settlement',
     async (_reason, cause) => {
       vi.useFakeTimers()
-      try {
-        const input = makeInput()
-        const progress = makeNativeFundingProgress()
-        mockReadiness(input, true)
-        const receipt = vi
-          .spyOn(input.publicClient, 'getTransactionReceipt')
-          .mockRejectedValueOnce(cause)
-          .mockResolvedValue({ status: 'success' } as Awaited<
-            ReturnType<typeof input.publicClient.getTransactionReceipt>
-          >)
-        const send = vi.spyOn(input.walletClient, 'sendTransaction')
-        getOrder.mockResolvedValue({ status: 'fulfilled' })
-        sendOrder.mockImplementation(async (request) =>
-          getCowShedOrderUid(request),
-        )
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          sellToken: NATIVE_ETH,
-          progress,
-        })
+      const input = makeInput()
+      const progress = makeNativeFundingProgress()
+      mockReadiness(input, true)
+      const receipt = vi
+        .spyOn(input.publicClient, 'getTransactionReceipt')
+        .mockRejectedValueOnce(cause)
+        .mockResolvedValue({ status: 'success' } as Awaited<
+          ReturnType<typeof input.publicClient.getTransactionReceipt>
+        >)
+      const send = vi.spyOn(input.walletClient, 'sendTransaction')
+      mockSettledOrders()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        sellToken: NATIVE_ETH,
+        progress,
+      })
 
-        await vi.advanceTimersByTimeAsync(4_999)
-        expect(receipt).toHaveBeenCalledTimes(1)
-        expect(getOrder).not.toHaveBeenCalled()
-        expect(input.onProgress).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(1)
-        expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-        expect(receipt.mock.calls).toEqual([[{ hash: HASH }], [{ hash: HASH }]])
-        expect(getOrder.mock.calls[0]).toEqual(['saved-native-funding'])
-        expect(input.onProgress.mock.calls[0]?.[0]).toEqual({
-          stage: 'funded',
-          plan: progress.plan,
-        })
-        expect(send).not.toHaveBeenCalled()
-        expect(getQuoteOnly).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(receipt).toHaveBeenCalledTimes(1)
+      expectNoCalls(getOrder, input.onProgress)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+      expect(receipt.mock.calls).toEqual([[{ hash: HASH }], [{ hash: HASH }]])
+      expect(getOrder.mock.calls[0]).toEqual(['saved-native-funding'])
+      expect(input.onProgress.mock.calls[0]?.[0]).toEqual({
+        stage: 'funded',
+        plan: progress.plan,
+      })
+      expectNoCalls(send, getQuoteOnly, postSwapOrderFromQuote)
     },
   )
 
@@ -492,36 +491,34 @@ describe('CoW Shed registration recovery', () => {
     async (_reason, cause) => {
       vi.useFakeTimers()
       vi.setSystemTime(0)
-      try {
-        const input = makeInput()
-        const receipt = vi
-          .spyOn(input.publicClient, 'getTransactionReceipt')
-          .mockRejectedValue(cause)
-        const send = vi.spyOn(input.walletClient, 'sendTransaction')
-        const complete = vi.fn()
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          sellToken: NATIVE_ETH,
-          progress: makeNativeFundingProgress(),
-        })
-        void pending.then(complete)
+      const input = makeInput()
+      const receipt = vi
+        .spyOn(input.publicClient, 'getTransactionReceipt')
+        .mockRejectedValue(cause)
+      const send = vi.spyOn(input.walletClient, 'sendTransaction')
+      const complete = vi.fn()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        sellToken: NATIVE_ETH,
+        progress: makeNativeFundingProgress(),
+      })
+      void pending.then(complete)
 
-        await vi.advanceTimersByTimeAsync(100_000)
-        expect(complete).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(20_000)
-        expect(await pending).toMatchObject({ error: { cause } })
-        const lookups = receipt.mock.calls.length
-        await vi.advanceTimersByTimeAsync(120_000)
-        expect(receipt).toHaveBeenCalledTimes(lookups)
-        expect(input.onProgress).not.toHaveBeenCalled()
-        expect(getOrder).not.toHaveBeenCalled()
-        expect(sendOrder).not.toHaveBeenCalled()
-        expect(send).not.toHaveBeenCalled()
-        expect(getQuoteOnly).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
+      await vi.advanceTimersByTimeAsync(100_000)
+      expect(complete).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(await pending).toMatchObject({ error: { cause } })
+      const lookups = receipt.mock.calls.length
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(receipt).toHaveBeenCalledTimes(lookups)
+      expectNoCalls(
+        input.onProgress,
+        getOrder,
+        sendOrder,
+        send,
+        getQuoteOnly,
+        postSwapOrderFromQuote,
+      )
     },
   )
 
@@ -529,46 +526,44 @@ describe('CoW Shed registration recovery', () => {
     'stops native funding after cancellation during a %s',
     async (step) => {
       vi.useFakeTimers()
-      try {
-        const input = makeInput()
-        const controller = new AbortController()
-        const receipt = vi.spyOn(input.publicClient, 'getTransactionReceipt')
-        if (step === 'receipt lookup') {
-          receipt.mockImplementation(async () => {
-            controller.abort(new Error('Stopped'))
-            return { status: 'success' } as Awaited<
-              ReturnType<typeof input.publicClient.getTransactionReceipt>
-            >
-          })
-        } else {
-          receipt.mockRejectedValue(
-            new TransactionReceiptNotFoundError({ hash: HASH }),
-          )
-        }
-        const send = vi.spyOn(input.walletClient, 'sendTransaction')
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          sellToken: NATIVE_ETH,
-          progress: makeNativeFundingProgress(),
-          signal: controller.signal,
+      const input = makeInput()
+      const controller = new AbortController()
+      const receipt = vi.spyOn(input.publicClient, 'getTransactionReceipt')
+      if (step === 'receipt lookup') {
+        receipt.mockImplementation(async () => {
+          controller.abort(new Error('Stopped'))
+          return { status: 'success' } as Awaited<
+            ReturnType<typeof input.publicClient.getTransactionReceipt>
+          >
         })
-
-        await vi.advanceTimersByTimeAsync(1_000)
-        controller.abort(new Error('Stopped'))
-        expect(await pending).toMatchObject({
-          error: { cause: new Error('Stopped') },
-        })
-        await vi.advanceTimersByTimeAsync(120_000)
-        expect(receipt).toHaveBeenCalledExactlyOnceWith({ hash: HASH })
-        expect(input.onProgress).not.toHaveBeenCalled()
-        expect(getOrder).not.toHaveBeenCalled()
-        expect(sendOrder).not.toHaveBeenCalled()
-        expect(send).not.toHaveBeenCalled()
-        expect(getQuoteOnly).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
+      } else {
+        receipt.mockRejectedValue(
+          new TransactionReceiptNotFoundError({ hash: HASH }),
+        )
       }
+      const send = vi.spyOn(input.walletClient, 'sendTransaction')
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        sellToken: NATIVE_ETH,
+        progress: makeNativeFundingProgress(),
+        signal: controller.signal,
+      })
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      controller.abort(new Error('Stopped'))
+      expect(await pending).toMatchObject({
+        error: { cause: new Error('Stopped') },
+      })
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(receipt).toHaveBeenCalledExactlyOnceWith({ hash: HASH })
+      expectNoCalls(
+        input.onProgress,
+        getOrder,
+        sendOrder,
+        send,
+        getQuoteOnly,
+        postSwapOrderFromQuote,
+      )
     },
   )
 
@@ -625,42 +620,35 @@ describe('CoW Shed registration recovery', () => {
           return handler(init)
         }),
       )
-      try {
-        const input = makeInput()
-        mockReadiness(input, true)
-        const request = makeRequest()
-        const plan = makePlan()
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          progress:
-            step === 'lookup'
-              ? {
-                  stage: 'publishing',
-                  plan,
-                  request,
-                  orderId: getCowShedOrderUid(request),
-                }
-              : { stage: 'funded', plan },
-        })
-        const complete = vi.fn()
-        void pending.then(complete)
-        await vi.advanceTimersByTimeAsync(4_999)
-        expect(complete).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(1)
-        expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-        expect(uploads).toHaveBeenCalledTimes(uploadCount)
-        expect(posts).toHaveBeenCalledTimes(postCount)
-        expect(posts.mock.calls.slice(1)).toEqual(posts.mock.calls.slice(0, -1))
-        expect(lookups.mock.calls.slice(1)).toEqual(
-          lookups.mock.calls.slice(0, -1),
-        )
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-        expect(getQuoteOnly).not.toHaveBeenCalled()
-      } finally {
-        realOrderBook.enabled = false
-        vi.unstubAllGlobals()
-        vi.useRealTimers()
-      }
+      const input = makeInput()
+      mockReadiness(input, true)
+      const request = makeRequest()
+      const plan = makePlan()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        progress:
+          step === 'lookup'
+            ? {
+                stage: 'publishing',
+                plan,
+                request,
+                orderId: getCowShedOrderUid(request),
+              }
+            : { stage: 'funded', plan },
+      })
+      const complete = vi.fn()
+      void pending.then(complete)
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(complete).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+      expect(uploads).toHaveBeenCalledTimes(uploadCount)
+      expect(posts).toHaveBeenCalledTimes(postCount)
+      expect(posts.mock.calls.slice(1)).toEqual(posts.mock.calls.slice(0, -1))
+      expect(lookups.mock.calls.slice(1)).toEqual(
+        lookups.mock.calls.slice(0, -1),
+      )
+      expectNoCalls(postSwapOrderFromQuote, getQuoteOnly)
     },
   )
 
@@ -676,31 +664,24 @@ describe('CoW Shed registration recovery', () => {
       const cause = new TypeError(message)
       const fetch = vi.fn().mockRejectedValue(cause)
       vi.stubGlobal('fetch', fetch)
-      try {
-        const input = makeInput()
-        mockReadiness(input, true)
-        const complete = vi.fn()
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          progress: { stage: 'funded', plan: makePlan() },
-        })
-        void pending.then(complete)
-        await vi.advanceTimersByTimeAsync(100_000)
-        expect(complete).toHaveBeenCalledTimes(isTransient ? 0 : 1)
-        await vi.advanceTimersByTimeAsync(20_000)
-        const error = (await pending)._unsafeUnwrapErr()
-        expect(error).toMatchObject({ cause: isTransient ? { cause } : cause })
-        const attempts = fetch.mock.calls.length
-        expect(attempts).toBe(isTransient ? 9 : 1)
-        await vi.advanceTimersByTimeAsync(120_000)
-        expect(fetch).toHaveBeenCalledTimes(attempts)
-        expect(input.onProgress).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        realOrderBook.enabled = false
-        vi.unstubAllGlobals()
-        vi.useRealTimers()
-      }
+      const input = makeInput()
+      mockReadiness(input, true)
+      const complete = vi.fn()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        progress: { stage: 'funded', plan: makePlan() },
+      })
+      void pending.then(complete)
+      await vi.advanceTimersByTimeAsync(100_000)
+      expect(complete).toHaveBeenCalledTimes(isTransient ? 0 : 1)
+      await vi.advanceTimersByTimeAsync(20_000)
+      const error = (await pending)._unsafeUnwrapErr()
+      expect(error).toMatchObject({ cause: isTransient ? { cause } : cause })
+      const attempts = fetch.mock.calls.length
+      expect(attempts).toBe(isTransient ? 9 : 1)
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(fetch).toHaveBeenCalledTimes(attempts)
+      expectNoCalls(input.onProgress, postSwapOrderFromQuote)
     },
   )
 
@@ -731,31 +712,25 @@ describe('CoW Shed registration recovery', () => {
         })
       }),
     )
-    try {
-      const input = makeInput()
-      mockReadiness(input, true)
-      const pending = runCowShedRegistrationActor({
-        ...input,
-        signal: controller.signal,
-        progress: { stage: 'funded', plan: makePlan() },
-      })
-      await vi.advanceTimersByTimeAsync(50)
-      expect(posts).toHaveBeenCalledTimes(1)
-      controller.abort(new Error('Stopped'))
-      await vi.advanceTimersByTimeAsync(2_000)
-      expect(await pending).toMatchObject({
-        error: { cause: new Error('Stopped') },
-      })
-      expect(posts).toHaveBeenCalledTimes(1)
-      expect(
-        input.onProgress.mock.calls.map(([progress]) => progress.stage),
-      ).toEqual(['publishing'])
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-    } finally {
-      realOrderBook.enabled = false
-      vi.unstubAllGlobals()
-      vi.useRealTimers()
-    }
+    const input = makeInput()
+    mockReadiness(input, true)
+    const pending = runCowShedRegistrationActor({
+      ...input,
+      signal: controller.signal,
+      progress: { stage: 'funded', plan: makePlan() },
+    })
+    await vi.advanceTimersByTimeAsync(50)
+    expect(posts).toHaveBeenCalledTimes(1)
+    controller.abort(new Error('Stopped'))
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(await pending).toMatchObject({
+      error: { cause: new Error('Stopped') },
+    })
+    expect(posts).toHaveBeenCalledTimes(1)
+    expect(
+      input.onProgress.mock.calls.map(([progress]) => progress.stage),
+    ).toEqual(['publishing'])
+    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
   })
 
   it.each(['fundingSent', 'revealSent'] as const)(
@@ -808,7 +783,6 @@ describe('CoW Shed registration recovery', () => {
       } finally {
         feedRead.mockReset()
         registryMulticall.mockReset()
-        vi.useRealTimers()
       }
     },
   )
@@ -823,31 +797,24 @@ describe('CoW Shed registration recovery', () => {
     'recovers a temporary %s failure without another purchase',
     async (step, cause) => {
       vi.useFakeTimers()
-      try {
-        const input = makeInput()
-        const plan = makePlan()
-        const read = mockReadiness(input, true)
-        if (step === 'readiness') read.mockRejectedValueOnce(cause)
-        else uploadAppData.mockRejectedValueOnce(cause)
-        sendOrder.mockImplementation(async (request) =>
-          getCowShedOrderUid(request),
-        )
-        getOrder.mockResolvedValue({ status: 'fulfilled' })
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          progress: { stage: 'funded', plan },
-        })
-        await vi.advanceTimersByTimeAsync(4_999)
-        expect(sendOrder).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(1)
-        expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-        expect(sendOrder).toHaveBeenCalledTimes(1)
-        for (const args of uploadAppData.mock.calls)
-          expect(args).toEqual([HASH, '{}'])
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
+      const input = makeInput()
+      const plan = makePlan()
+      const read = mockReadiness(input, true)
+      if (step === 'readiness') read.mockRejectedValueOnce(cause)
+      else uploadAppData.mockRejectedValueOnce(cause)
+      mockSettledOrders()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        progress: { stage: 'funded', plan },
+      })
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(sendOrder).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+      expect(sendOrder).toHaveBeenCalledTimes(1)
+      for (const args of uploadAppData.mock.calls)
+        expect(args).toEqual([HASH, '{}'])
+      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
     },
   )
 
@@ -855,47 +822,43 @@ describe('CoW Shed registration recovery', () => {
     'reconciles a lost publication acknowledgement when the saved UID is %s',
     async (visibility) => {
       vi.useFakeTimers()
-      try {
-        const input = makeInput()
-        mockReadiness(input, true)
-        sendOrder
-          .mockRejectedValueOnce(
-            new HttpRequestError({ status: 503, url: 'https://api.test' }),
-          )
-          .mockImplementation(async (request) => getCowShedOrderUid(request))
-        const unavailable = new OrderBookApiError(
-          new Response('', { status: 503 }),
-          {},
+      const input = makeInput()
+      mockReadiness(input, true)
+      sendOrder
+        .mockRejectedValueOnce(
+          new HttpRequestError({ status: 503, url: 'https://api.test' }),
         )
-        getOrder.mockRejectedValueOnce(unavailable)
-        if (visibility === 'missing')
-          getOrder.mockRejectedValueOnce(
-            new OrderBookApiError(new Response('', { status: 404 }), {
-              errorType: 'OrderNotFound',
-            }),
-          )
-        getOrder.mockResolvedValue({ status: 'fulfilled' })
-        const plan = makePlan()
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          progress: { stage: 'funded', plan },
-        })
-        await vi.advanceTimersByTimeAsync(5_000)
-        expect(sendOrder).toHaveBeenCalledTimes(1)
-        await vi.advanceTimersByTimeAsync(10_000)
-        expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-        expect(sendOrder).toHaveBeenCalledTimes(visibility === 'known' ? 1 : 2)
-        const publication = input.onProgress.mock.calls.find(
-          ([progress]) => progress.stage === 'publishing',
-        )?.[0]
-        for (const [request] of sendOrder.mock.calls)
-          expect(request).toBe(publication.request)
-        for (const [uid] of getOrder.mock.calls)
-          expect(uid).toBe(publication.orderId)
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
+        .mockImplementation(async (request) => getCowShedOrderUid(request))
+      const unavailable = new OrderBookApiError(
+        new Response('', { status: 503 }),
+        {},
+      )
+      getOrder.mockRejectedValueOnce(unavailable)
+      if (visibility === 'missing')
+        getOrder.mockRejectedValueOnce(
+          new OrderBookApiError(new Response('', { status: 404 }), {
+            errorType: 'OrderNotFound',
+          }),
+        )
+      getOrder.mockResolvedValue({ status: 'fulfilled' })
+      const plan = makePlan()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        progress: { stage: 'funded', plan },
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(sendOrder).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+      expect(sendOrder).toHaveBeenCalledTimes(visibility === 'known' ? 1 : 2)
+      const publication = input.onProgress.mock.calls.find(
+        ([progress]) => progress.stage === 'publishing',
+      )?.[0]
+      for (const [request] of sendOrder.mock.calls)
+        expect(request).toBe(publication.request)
+      for (const [uid] of getOrder.mock.calls)
+        expect(uid).toBe(publication.orderId)
+      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
     },
   )
 
@@ -921,10 +884,7 @@ describe('CoW Shed registration recovery', () => {
           { status: 0, latestOwner: zeroAddress },
           zeroAddress,
         ])
-        getOrder.mockResolvedValue({ status: 'fulfilled' })
-        sendOrder.mockImplementation(async (request) =>
-          getCowShedOrderUid(request),
-        )
+        mockSettledOrders()
         const complete = vi.fn()
         const pending = runCowShedRegistrationActor({
           ...input,
@@ -934,8 +894,7 @@ describe('CoW Shed registration recovery', () => {
         await vi.advanceTimersByTimeAsync(
           visibility === 'visible' ? 9_999 : 29_999,
         )
-        expect(complete).not.toHaveBeenCalled()
-        expect(sendOrder).not.toHaveBeenCalled()
+        expectNoCalls(complete, sendOrder)
         await vi.advanceTimersByTimeAsync(1)
         const result = await pending
         if (visibility === 'visible') {
@@ -953,7 +912,6 @@ describe('CoW Shed registration recovery', () => {
       } finally {
         feedRead.mockReset()
         registryMulticall.mockReset()
-        vi.useRealTimers()
       }
     },
   )
@@ -963,38 +921,31 @@ describe('CoW Shed registration recovery', () => {
     ['RPC timeout', new TimeoutError({ body: {}, url: 'https://rpc.test' })],
   ] as const)('retries order generation after a %s', async (_reason, cause) => {
     vi.useFakeTimers()
-    try {
-      const input = makeInput()
-      const read = mockReadiness(input, true)
-      const readyRead = read.getMockImplementation()
-      const generate = vi
-        .fn()
-        .mockRejectedValueOnce(cause)
-        .mockResolvedValue(makeTradeableOrder())
-      read.mockImplementation(async (args) =>
-        args.functionName === 'getTradeableOrderWithSignature'
-          ? generate()
-          : readyRead?.(args),
-      )
-      getOrder.mockResolvedValue({ status: 'fulfilled' })
-      sendOrder.mockImplementation(async (request) =>
-        getCowShedOrderUid(request),
-      )
-      const pending = runCowShedRegistrationActor({
-        ...input,
-        progress: { stage: 'funded', plan: makePlan() },
-      })
-      await vi.advanceTimersByTimeAsync(4_999)
-      expect(generate).toHaveBeenCalledTimes(1)
-      expect(sendOrder).not.toHaveBeenCalled()
-      await vi.advanceTimersByTimeAsync(1)
-      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-      expect(generate).toHaveBeenCalledTimes(2)
-      expect(sendOrder).toHaveBeenCalledTimes(1)
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-    } finally {
-      vi.useRealTimers()
-    }
+    const input = makeInput()
+    const read = mockReadiness(input, true)
+    const readyRead = read.getMockImplementation()
+    const generate = vi
+      .fn()
+      .mockRejectedValueOnce(cause)
+      .mockResolvedValue(makeTradeableOrder())
+    read.mockImplementation(async (args) =>
+      args.functionName === 'getTradeableOrderWithSignature'
+        ? generate()
+        : readyRead?.(args),
+    )
+    mockSettledOrders()
+    const pending = runCowShedRegistrationActor({
+      ...input,
+      progress: { stage: 'funded', plan: makePlan() },
+    })
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(generate).toHaveBeenCalledTimes(1)
+    expect(sendOrder).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+    expect(generate).toHaveBeenCalledTimes(2)
+    expect(sendOrder).toHaveBeenCalledTimes(1)
+    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
   })
 
   it.each(['readiness', 'appData', 'nextBlock', 'publication'] as const)(
@@ -1044,11 +995,9 @@ describe('CoW Shed registration recovery', () => {
         expect(read).toHaveBeenCalledTimes(reads)
         expect(uploadAppData).toHaveBeenCalledTimes(uploads)
         expect(getOrder).toHaveBeenCalledTimes(lookups)
-        expect(sendOrder).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+        expectNoCalls(sendOrder, postSwapOrderFromQuote)
       } finally {
         uploadAppData.mockResolvedValue({})
-        vi.useRealTimers()
       }
     },
   )
@@ -1075,9 +1024,7 @@ describe('CoW Shed registration recovery', () => {
       },
     })
     expect(result.isErr()).toBe(true)
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(sendOrder).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(input.onProgress, sendOrder, postSwapOrderFromQuote)
   })
 
   it.each(['epoch', 'appData', 'publication'] as const)(
@@ -1116,11 +1063,9 @@ describe('CoW Shed registration recovery', () => {
           input.onProgress.mock.calls.map(([progress]) => progress.stage),
         ).toEqual(step === 'publication' ? ['publishing'] : [])
         expect(sendOrder).toHaveBeenCalledTimes(step === 'publication' ? 1 : 0)
-        expect(getOrder).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+        expectNoCalls(getOrder, postSwapOrderFromQuote)
       } finally {
         uploadAppData.mockResolvedValue({})
-        vi.useRealTimers()
       }
     },
   )
@@ -1128,139 +1073,117 @@ describe('CoW Shed registration recovery', () => {
   it('stops repeated epoch hints at the original signed expiry', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
-    try {
-      const input = makeInput()
-      const read = mockReadiness(input, true)
-      const readyRead = read.getMockImplementation()
-      read.mockImplementation(async (args) => {
-        if (args.functionName === 'getTradeableOrderWithSignature')
-          throw pollingError('PollTryAtEpoch', 5_000n)
-        return readyRead?.(args)
-      })
-      vi.spyOn(input.publicClient, 'getBlock').mockImplementation(
-        async () =>
-          ({
-            timestamp: 1_500n + BigInt(Math.floor(Date.now() / 1_000)),
-          }) as Awaited<ReturnType<typeof input.publicClient.getBlock>>,
-      )
-      const pending = runCowShedRegistrationActor({
-        ...input,
-        progress: { stage: 'funded', plan: makePlan() },
-      })
-      await vi.advanceTimersByTimeAsync(3_405_000)
-      expect(await pending).toMatchObject({
-        error: { cause: 'The registration authorization expired.' },
-      })
-      expect(input.onProgress).not.toHaveBeenCalled()
-      expect(sendOrder).not.toHaveBeenCalled()
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-    } finally {
-      vi.useRealTimers()
-    }
+    const input = makeInput()
+    const read = mockReadiness(input, true)
+    const readyRead = read.getMockImplementation()
+    read.mockImplementation(async (args) => {
+      if (args.functionName === 'getTradeableOrderWithSignature')
+        throw pollingError('PollTryAtEpoch', 5_000n)
+      return readyRead?.(args)
+    })
+    vi.spyOn(input.publicClient, 'getBlock').mockImplementation(
+      async () =>
+        ({
+          timestamp: 1_500n + BigInt(Math.floor(Date.now() / 1_000)),
+        }) as Awaited<ReturnType<typeof input.publicClient.getBlock>>,
+    )
+    const pending = runCowShedRegistrationActor({
+      ...input,
+      progress: { stage: 'funded', plan: makePlan() },
+    })
+    await vi.advanceTimersByTimeAsync(3_405_000)
+    expect(await pending).toMatchObject({
+      error: { cause: 'The registration authorization expired.' },
+    })
+    expectNoCalls(input.onProgress, sendOrder, postSwapOrderFromQuote)
   })
 
   it('honors Retry-After before uploading the same app data again', async () => {
     vi.useFakeTimers()
-    try {
-      const input = makeInput()
-      mockReadiness(input, true)
-      uploadAppData.mockRejectedValueOnce(
-        new OrderBookApiError(
-          new Response('', { status: 429, headers: { 'Retry-After': '20' } }),
-          {},
-        ),
-      )
-      getOrder.mockResolvedValue({ status: 'fulfilled' })
-      sendOrder.mockImplementation(async (request) =>
-        getCowShedOrderUid(request),
-      )
-      const pending = runCowShedRegistrationActor({
-        ...input,
-        progress: { stage: 'funded', plan: makePlan() },
-      })
-      await vi.advanceTimersByTimeAsync(19_999)
-      expect(uploadAppData).toHaveBeenCalledTimes(1)
-      expect(sendOrder).not.toHaveBeenCalled()
-      await vi.advanceTimersByTimeAsync(1)
-      expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
-      expect(uploadAppData.mock.calls).toEqual([
-        [HASH, '{}'],
-        [HASH, '{}'],
-      ])
-    } finally {
-      vi.useRealTimers()
-    }
+    const input = makeInput()
+    mockReadiness(input, true)
+    uploadAppData.mockRejectedValueOnce(
+      new OrderBookApiError(
+        new Response('', { status: 429, headers: { 'Retry-After': '20' } }),
+        {},
+      ),
+    )
+    mockSettledOrders()
+    const pending = runCowShedRegistrationActor({
+      ...input,
+      progress: { stage: 'funded', plan: makePlan() },
+    })
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(uploadAppData).toHaveBeenCalledTimes(1)
+    expect(sendOrder).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await pending).toMatchObject({ value: { cowShedAccount: SHED } })
+    expect(uploadAppData.mock.calls).toEqual([
+      [HASH, '{}'],
+      [HASH, '{}'],
+    ])
   })
 
   it.each([10, 180])(
     'waits %s seconds for an encoded commitment epoch without signing or funding again',
     async (waitSeconds) => {
       vi.useFakeTimers()
-      try {
-        const rpc = vi
-          .fn()
-          .mockRejectedValueOnce({
-            code: 3,
-            message: 'execution reverted',
-            data: encodeErrorResult({
-              abi: parseAbi([
-                'error PollTryAtEpoch(uint256 timestamp,string reason)',
-              ]),
-              errorName: 'PollTryAtEpoch',
-              args: [1_500n + BigInt(waitSeconds), 'commitment too new'],
-            }),
-          })
-          .mockResolvedValue(
-            encodeFunctionResult({
-              abi: COW_TRADEABLE_ORDER_ABI,
-              functionName: 'getTradeableOrderWithSignature',
-              result: makeTradeableOrder(),
-            }),
-          )
-        const input = makeInput(rpc)
-        const generate = input.publicClient.readContract
-        const read = mockReadiness(input, true)
-        const readyRead = read.getMockImplementation()
-        read.mockImplementation(async (args) =>
-          args.functionName === 'getTradeableOrderWithSignature'
-            ? generate(args)
-            : readyRead?.(args),
-        )
-        vi.spyOn(input.publicClient, 'getBlock').mockImplementation(
-          async () =>
-            ({
-              timestamp: 1_500n + BigInt(Math.floor(Date.now() / 1_000)),
-            }) as Awaited<ReturnType<typeof input.publicClient.getBlock>>,
-        )
-        vi.setSystemTime(0)
-        const sign = vi.spyOn(input.walletClient, 'signTypedData')
-        const plan = makePlan()
-        sendOrder.mockImplementation(async (request) =>
-          getCowShedOrderUid(request),
-        )
-        getOrder.mockResolvedValue({ status: 'fulfilled' })
-        const pending = runCowShedRegistrationActor({
-          ...input,
-          progress: { stage: 'funded', plan },
+      const rpc = vi
+        .fn()
+        .mockRejectedValueOnce({
+          code: 3,
+          message: 'execution reverted',
+          data: encodeErrorResult({
+            abi: parseAbi([
+              'error PollTryAtEpoch(uint256 timestamp,string reason)',
+            ]),
+            errorName: 'PollTryAtEpoch',
+            args: [1_500n + BigInt(waitSeconds), 'commitment too new'],
+          }),
         })
-        await vi.advanceTimersByTimeAsync(waitSeconds * 1_000 - 1)
-        expect(sendOrder).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(1)
-        const result = await pending
-        expect(result).toMatchObject({ value: { cowShedAccount: SHED } })
-        expect(sendOrder).toHaveBeenCalledTimes(1)
-        expect(rpc).toHaveBeenCalledTimes(2)
-        expect(
-          input.onProgress.mock.calls.map(([progress]) => progress.stage),
-        ).toEqual(['publishing', 'revealSent', 'settled'])
-        for (const [progress] of input.onProgress.mock.calls)
-          expect(progress.plan.signed).toBe(plan.signed)
-        expect(sign).not.toHaveBeenCalled()
-        expect(getQuoteOnly).not.toHaveBeenCalled()
-        expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
+        .mockResolvedValue(
+          encodeFunctionResult({
+            abi: COW_TRADEABLE_ORDER_ABI,
+            functionName: 'getTradeableOrderWithSignature',
+            result: makeTradeableOrder(),
+          }),
+        )
+      const input = makeInput(rpc)
+      const generate = input.publicClient.readContract
+      const read = mockReadiness(input, true)
+      const readyRead = read.getMockImplementation()
+      read.mockImplementation(async (args) =>
+        args.functionName === 'getTradeableOrderWithSignature'
+          ? generate(args)
+          : readyRead?.(args),
+      )
+      vi.spyOn(input.publicClient, 'getBlock').mockImplementation(
+        async () =>
+          ({
+            timestamp: 1_500n + BigInt(Math.floor(Date.now() / 1_000)),
+          }) as Awaited<ReturnType<typeof input.publicClient.getBlock>>,
+      )
+      vi.setSystemTime(0)
+      const sign = vi.spyOn(input.walletClient, 'signTypedData')
+      const plan = makePlan()
+      mockSettledOrders()
+      const pending = runCowShedRegistrationActor({
+        ...input,
+        progress: { stage: 'funded', plan },
+      })
+      await vi.advanceTimersByTimeAsync(waitSeconds * 1_000 - 1)
+      expect(sendOrder).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      const result = await pending
+      expect(result).toMatchObject({ value: { cowShedAccount: SHED } })
+      expect(sendOrder).toHaveBeenCalledTimes(1)
+      expect(rpc).toHaveBeenCalledTimes(2)
+      expect(
+        input.onProgress.mock.calls.map(([progress]) => progress.stage),
+      ).toEqual(['publishing', 'revealSent', 'settled'])
+      for (const [progress] of input.onProgress.mock.calls)
+        expect(progress.plan.signed).toBe(plan.signed)
+      expectNoCalls(sign, getQuoteOnly, postSwapOrderFromQuote)
     },
   )
 
@@ -1295,10 +1218,12 @@ describe('CoW Shed registration recovery', () => {
         ],
       }),
     )
-    expect(preflight).not.toHaveBeenCalled()
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(
+      preflight,
+      input.onProgress,
+      getQuoteOnly,
+      postSwapOrderFromQuote,
+    )
   })
 
   it('publishes at the live minimum age without rebuilding saved hooks', async () => {
@@ -1341,9 +1266,7 @@ describe('CoW Shed registration recovery', () => {
     ).toEqual(['publishing', 'revealSent', 'settled'])
     for (const [progress] of input.onProgress.mock.calls)
       expect(progress.plan.signed).toBe(plan.signed)
-    expect(sign).not.toHaveBeenCalled()
-    expect(preflight).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(sign, preflight, postSwapOrderFromQuote)
   })
 
   it('does not publish or repurchase when a funded single order has no authorization', async () => {
@@ -1365,10 +1288,12 @@ describe('CoW Shed registration recovery', () => {
         cowShedAccount: SHED,
       },
     })
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(uploadAppData).not.toHaveBeenCalled()
-    expect(sendOrder).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(
+      input.onProgress,
+      uploadAppData,
+      sendOrder,
+      postSwapOrderFromQuote,
+    )
   })
 
   it('rechecks live readiness before reposting a missing saved publication', async () => {
@@ -1394,9 +1319,7 @@ describe('CoW Shed registration recovery', () => {
           'The authorization, Shed balance, or registration price changed.',
       },
     })
-    expect(sendOrder).not.toHaveBeenCalled()
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(sendOrder, input.onProgress, postSwapOrderFromQuote)
   })
 
   it('reposts only the exact saved reveal request after a missing publication and handles duplicate acknowledgement', async () => {
@@ -1518,8 +1441,7 @@ describe('CoW Shed registration recovery', () => {
           { action, phase: 'awaitingSignature' },
         ],
       )
-      expect(input.onProgress).not.toHaveBeenCalled()
-      expect(getQuoteOnly).not.toHaveBeenCalled()
+      expectNoCalls(input.onProgress, getQuoteOnly)
     },
   )
 
@@ -1601,8 +1523,7 @@ describe('CoW Shed registration recovery', () => {
     })
     expect(result).toMatchObject({ error: { cause } })
     expect(input.onProgress).toHaveBeenCalledTimes(1)
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(getQuoteOnly, postSwapOrderFromQuote)
   })
 
   it('keeps a prepared plan recoverable when its exact saved setup call fails preflight', async () => {
@@ -1635,9 +1556,7 @@ describe('CoW Shed registration recovery', () => {
       gas: 987_654n,
     })
     expect(result).toMatchObject({ error: { cause, cowShedAccount: SHED } })
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(input.onProgress, getQuoteOnly, postSwapOrderFromQuote)
   })
 
   it('does not mark funding submission when aborted during setup preflight', async () => {
@@ -1656,9 +1575,7 @@ describe('CoW Shed registration recovery', () => {
     expect(result.isErr()).toBe(true)
     if (result.isErr())
       expect(result.error.message).not.toContain('needs recovery')
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(getQuoteOnly).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(input.onProgress, getQuoteOnly, postSwapOrderFromQuote)
   })
 
   it('can preflight the saved funding authorization at its expiry timestamp', async () => {
@@ -1693,9 +1610,7 @@ describe('CoW Shed registration recovery', () => {
       progress: { stage: 'prepared', plan: makePlan() },
     })
     expect(result.isErr()).toBe(true)
-    expect(preflight).not.toHaveBeenCalled()
-    expect(input.onProgress).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(preflight, input.onProgress, postSwapOrderFromQuote)
   })
 
   it.each([
@@ -1728,9 +1643,7 @@ describe('CoW Shed registration recovery', () => {
       controller.abort()
       const result = await pending
       expect(result.isErr()).toBe(true)
-      expect(uploadAppData).not.toHaveBeenCalled()
-      expect(sendOrder).not.toHaveBeenCalled()
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+      expectNoCalls(uploadAppData, sendOrder, postSwapOrderFromQuote)
     },
   )
 
@@ -1748,8 +1661,7 @@ describe('CoW Shed registration recovery', () => {
     expect(input.onProgress).toHaveBeenCalledWith(
       expect.objectContaining({ stage: 'settled', orderId }),
     )
-    expect(sendOrder).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(sendOrder, postSwapOrderFromQuote)
   })
 
   it.each([
@@ -1775,10 +1687,12 @@ describe('CoW Shed registration recovery', () => {
         progress: { stage: 'funded', plan },
       })
       expect(result.isErr()).toBe(true)
-      expect(input.onProgress).not.toHaveBeenCalled()
-      expect(uploadAppData).not.toHaveBeenCalled()
-      expect(sendOrder).not.toHaveBeenCalled()
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+      expectNoCalls(
+        input.onProgress,
+        uploadAppData,
+        sendOrder,
+        postSwapOrderFromQuote,
+      )
     },
   )
 
@@ -1947,8 +1861,7 @@ describe('CoW Shed registration recovery', () => {
     expect(input.onProgress).toHaveBeenCalledWith(
       expect.objectContaining({ stage: 'fundingSubmission' }),
     )
-    expect(getOrder).not.toHaveBeenCalled()
-    expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
+    expectNoCalls(getOrder, postSwapOrderFromQuote)
   })
 
   it('records funding completion before checking the hook and never purchases again', async () => {
@@ -2038,9 +1951,7 @@ describe('CoW Shed registration recovery', () => {
       expect(input.onProgress).toHaveBeenCalledWith(
         expect.objectContaining({ stage: 'settled' }),
       )
-      expect(preflight).not.toHaveBeenCalled()
-      expect(postSwapOrderFromQuote).not.toHaveBeenCalled()
-      expect(sendOrder).not.toHaveBeenCalled()
+      expectNoCalls(preflight, postSwapOrderFromQuote, sendOrder)
     },
   )
 

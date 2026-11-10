@@ -14,14 +14,14 @@ import { REGISTRATION_RESUME_STORAGE_KEY } from './registrationPersistence'
 const owner = '0x1111111111111111111111111111111111111111' as const
 const hash = `0x${'11'.repeat(32)}` as const
 const otherSalt = `0x${'22'.repeat(32)}` as const
-const progress: CowShedProgress = {
+const makeProgress = (name = 'first.eth', salt = hash): CowShedProgress => ({
   stage: 'prepared',
   plan: {
     authorization: {
       chainId: 11155111,
       wallet: owner,
       resolver: owner,
-      name: 'first.eth',
+      name,
       duration: 31_536_000n,
       secret: hash,
       commitment: hash,
@@ -29,7 +29,7 @@ const progress: CowShedProgress = {
       executionBudget: 250_000n,
       firstOrderValidTo: 1_900_000_000n,
       secondOrderValidTo: 1_900_004_000n,
-      salt: hash,
+      salt,
       setupNonce: hash,
       registrationNonce: hash,
     },
@@ -53,7 +53,7 @@ const progress: CowShedProgress = {
     },
     maximumSell: 1000n,
   },
-}
+})
 const record = () =>
   buildRegistrationRecord(
     'runningCowShedRegistration',
@@ -64,7 +64,7 @@ const record = () =>
       duration: 31_536_000n,
       selectedToken: 'USDC',
       tokenPrice: 5_000_000n,
-      cowShedRun: progress,
+      cowShedRun: makeProgress(),
     },
     1,
   )
@@ -100,17 +100,7 @@ describe('Shed recovery across names', () => {
       context: {
         ...prior.context,
         name: 'second.eth',
-        cowShedRun: {
-          ...progress,
-          plan: {
-            ...progress.plan,
-            authorization: {
-              ...progress.plan.authorization,
-              name: 'second.eth',
-              salt: otherSalt,
-            },
-          },
-        },
+        cowShedRun: makeProgress('second.eth', otherSalt),
       },
     }
     saveCowShedRecovery(next, storage)
