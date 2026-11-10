@@ -86,7 +86,6 @@ import { NetworkFeeReceipt, PaymentReceipt } from './PaymentReceipt'
 import { PriceCooldownPill } from './PriceCooldownPill'
 import { RECEIPT_LABEL } from './receiptTypography'
 import { TokenListItem } from './TokenListItem'
-import { WalletSigningProgress } from './WalletSigningProgress'
 
 const MEDIUM_NAME_CHAR_THRESHOLD = 10
 const LONG_NAME_CHAR_THRESHOLD = 43
@@ -213,11 +212,7 @@ export const TokenPickerContent = () => {
       const token = state?.context.ethFunding?.sellToken
       const progress = state?.context.walletProgress
       if (!token || !progress) return undefined
-      return {
-        token,
-        progress,
-        hasSignedHooks: state.context.cowShedRun !== undefined,
-      }
+      return { token, progress }
     },
   )
   useRegistrationLockHeartbeat(
@@ -1559,19 +1554,19 @@ const PaymentPicker = <T extends TOKEN_SYMBOL>({
           />
         )}
 
-        {signingView && <WalletSigningProgress view={signingView} />}
+        {signingView && (
+          <p aria-live="polite" className="px-1 text-ens-quartz-500 text-xs">
+            {t(signingView.description)}
+          </p>
+        )}
         <PaymentAction
           canNext={canNext}
-          helpMessage={
-            signingView?.current
-              ? t(signingView.current.description)
-              : helpMessage
-          }
+          helpMessage={signingView ? t(signingView.description) : helpMessage}
           isBusy={isBusy}
           isSettling={isSettling}
           label={
-            signingView?.current
-              ? t(signingView.current.label)
+            signingView
+              ? t(signingView.label)
               : getActionLabel({
                   isSelectionShort: isSelectedMethodShort(
                     isWalletSelectionShort,

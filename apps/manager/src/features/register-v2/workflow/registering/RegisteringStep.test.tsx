@@ -145,7 +145,7 @@ describe('RegisteringStep', () => {
   })
 
   it.each(['settings', 'completed'] as const)(
-    'shows linked live progress when notifications are %s',
+    'shows the Account Proxy link when notifications are %s',
     async (notifications) => {
       const plan = await makePlan()
       const { uiSnapshot, txSnapshot, readUi, readTx } = setupRegistration(1)
@@ -172,14 +172,20 @@ describe('RegisteringStep', () => {
         { wrapper: I18nWrapper },
       )
       expect(
-        screen.getByRole('list', { name: 'Registration progress' }),
-      ).toBeVisible()
-      expect(
-        screen.getByRole('link', { name: 'View registration order' }),
-      ).toHaveAttribute(
+        screen.queryByRole('list', { name: 'Registration progress' }),
+      ).not.toBeInTheDocument()
+      const recoveryLink = screen.getByRole('link', {
+        name: 'Recover funds in CoW Swap',
+      })
+      expect(recoveryLink).toHaveAttribute(
         'href',
-        'https://dev.explorer.cow.fi/sepolia/orders/live-order?tab=overview',
+        `https://swap.cow.fi/#/11155111/account-proxy/${plan.signed.cowShedAccount}`,
       )
+      expect(recoveryLink).toHaveAttribute('target', '_blank')
+      expect(recoveryLink).toHaveAttribute('rel', 'noopener noreferrer')
+      expect(
+        screen.queryByRole('link', { name: 'View registration order' }),
+      ).not.toBeInTheDocument()
       expect(screen.queryByText(/Do not add funds/)).not.toBeInTheDocument()
     },
   )

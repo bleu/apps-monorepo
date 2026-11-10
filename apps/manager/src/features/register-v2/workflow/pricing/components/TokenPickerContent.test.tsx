@@ -2,13 +2,7 @@ import '@testing-library/jest-dom'
 import { NATIVE_ETH } from '@ens-apps/transaction-manager'
 import { i18n } from '@lingui/core'
 import { I18nProvider } from '@lingui/react'
-import {
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-  within,
-} from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { arbitrumSepolia, baseSepolia, optimismSepolia } from 'viem/chains'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { L2Source } from '@/l2Sources'
@@ -1084,7 +1078,7 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
   // The payment landed in the account, which now covers it all.
   const covered = { ...owed, total: 0.84, walletDebit: 0, hcaCredit: 0.84 }
 
-  it('updates wallet signing steps without changing the confirmed receipt', () => {
+  it('updates the current wallet request without changing the confirmed receipt', () => {
     const { rerender } = render(picker({ funding: owed }))
     rerender(
       picker({
@@ -1092,10 +1086,7 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
         isBusy: true,
         walletSigning: {
           token: NATIVE_ETH,
-          progress: {
-            completed: [],
-            current: { action: 'registrationHook', phase: 'awaitingSignature' },
-          },
+          progress: { action: 'registrationHook', phase: 'awaitingSignature' },
         },
       }),
     )
@@ -1110,25 +1101,20 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
         isBusy: true,
         walletSigning: {
           token: NATIVE_ETH,
-          progress: {
-            completed: ['registrationHook'],
-            current: { action: 'setupHook', phase: 'awaitingSignature' },
-          },
+          progress: { action: 'setupHook', phase: 'awaitingSignature' },
         },
       }),
     )
     expect(
       screen.getByRole('button', { name: 'Sign setup hook' }),
     ).toBeDisabled()
-    const checklist = screen.getByRole('list', {
-      name: 'Wallet signing progress',
-    })
     expect(
-      within(checklist).getByText('Registration hook').closest('li'),
-    ).toHaveTextContent('Completed')
+      screen.queryByRole('list', { name: 'Wallet signing progress' }),
+    ).not.toBeInTheDocument()
     expect(
-      within(checklist).getByText('Setup hook').closest('li'),
-    ).toHaveAttribute('aria-current', 'step')
+      screen.queryByText(/authorize registration of the name/),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText(/authorize the name commitment/)).toBeVisible()
     expect(receiptRow('You pay')).toHaveTextContent('$0.04')
 
     rerender(
@@ -1137,10 +1123,7 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
         isBusy: true,
         walletSigning: {
           token: NATIVE_ETH,
-          progress: {
-            completed: ['registrationHook', 'setupHook'],
-            current: { action: 'nativePayment', phase: 'awaitingConfirmation' },
-          },
+          progress: { action: 'nativePayment', phase: 'awaitingConfirmation' },
         },
       }),
     )
@@ -1150,6 +1133,12 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
     expect(
       screen.getByText(/Waiting for the ETH payment transaction/),
     ).toBeVisible()
+    expect(receiptRow('You pay')).toHaveTextContent('$0.04')
+
+    rerender(picker({ funding: covered, isBusy: true }))
+    expect(
+      screen.queryByText(/Waiting for the ETH payment transaction/),
+    ).not.toBeInTheDocument()
     expect(receiptRow('You pay')).toHaveTextContent('$0.04')
 
     rerender(picker({ funding: owed }))

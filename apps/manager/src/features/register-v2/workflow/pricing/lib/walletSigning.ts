@@ -1,40 +1,19 @@
 import type {
   CowSellToken,
-  RegistrationWalletProgress,
-  WalletAction,
   WalletProgress,
 } from '@ens-apps/transaction-manager'
-import type { MessageDescriptor } from '@lingui/core'
 import { msg } from '@lingui/core/macro'
 import { match } from 'ts-pattern'
 
 export interface WalletSigningInput {
-  readonly token: Pick<CowSellToken, 'symbol' | 'isNative'>
-  readonly progress: RegistrationWalletProgress
-  readonly hasSignedHooks?: boolean
+  readonly token: Pick<CowSellToken, 'symbol'>
+  readonly progress: WalletProgress
 }
 
-const HOOK_ACTIONS = ['registrationHook', 'setupHook'] as const
-const TOKEN_AUTHORIZATION_ACTIONS = [
-  'tokenPermit',
-  'resetAllowance',
-  'tokenApproval',
-] as const
-
-const STEP_LABELS: Readonly<Record<WalletAction, MessageDescriptor>> = {
-  registrationHook: msg`Registration hook`,
-  setupHook: msg`Setup hook`,
-  tokenPermit: msg`Token permit`,
-  resetAllowance: msg`Reset allowance`,
-  tokenApproval: msg`Token approval`,
-  nativePayment: msg`ETH payment`,
-  paymentOrder: msg`Payment order`,
-}
-
-const getCurrentRequest = (
-  { action, phase }: WalletProgress,
-  symbol: string,
-) => {
+export const getWalletSigningView = ({
+  token: { symbol },
+  progress: { action, phase },
+}: WalletSigningInput) => {
   if (phase === 'completed') return undefined
   return match({ action, phase })
     .with({ action: 'registrationHook' }, () => ({
@@ -79,55 +58,3 @@ const getCurrentRequest = (
     }))
     .exhaustive()
 }
-
-export const getWalletSigningView = ({
-  token,
-  progress,
-  hasSignedHooks = false,
-}: WalletSigningInput) => {
-  const observed = [
-    ...progress.completed,
-    ...(progress.current ? [progress.current.action] : []),
-  ]
-  const hasHookSteps =
-    hasSignedHooks ||
-    observed.some(
-      (action) => action === 'registrationHook' || action === 'setupHook',
-    )
-  const paymentAction: WalletAction = token.isNative
-    ? 'nativePayment'
-    : 'paymentOrder'
-  const actions: readonly WalletAction[] = [
-    ...(hasHookSteps ? HOOK_ACTIONS : []),
-    ...TOKEN_AUTHORIZATION_ACTIONS.filter((action) =>
-      observed.includes(action),
-    ),
-    paymentAction,
-  ]
-  const current =
-    progress.current && getCurrentRequest(progress.current, token.symbol)
-  return {
-    current,
-    steps: actions.map((action) => ({
-      action,
-      label: STEP_LABELS[action],
-      status: match(action)
-        .when(
-          (action) =>
-            progress.current?.action === action &&
-            progress.current.phase !== 'completed',
-          () => 'active' as const,
-        )
-        .when(
-          (action) =>
-            progress.completed.includes(action) ||
-            (hasSignedHooks &&
-              (action === 'registrationHook' || action === 'setupHook')),
-          () => 'completed' as const,
-        )
-        .otherwise(() => 'pending' as const),
-    })),
-  }
-}
-
-export type WalletSigningView = ReturnType<typeof getWalletSigningView>

@@ -397,11 +397,19 @@ describe('registrationMachine Shed progress ownership', () => {
       await waitFor(actor, (snapshot) => snapshot.matches(state))
       const first = callbacks[0]
       assert(first)
-      first({ action: 'tokenApproval', phase: 'completed' })
+      first({ action: 'tokenApproval', phase: 'awaitingSignature' })
       expect(actor.getSnapshot().context.walletProgress).toEqual({
-        current: undefined,
-        completed: ['tokenApproval'],
+        action: 'tokenApproval',
+        phase: 'awaitingSignature',
       })
+      first({ action: 'tokenApproval', phase: 'awaitingConfirmation' })
+      expect(actor.getSnapshot().context.walletProgress).toEqual({
+        action: 'tokenApproval',
+        phase: 'awaitingConfirmation',
+      })
+      first({ action: 'tokenApproval', phase: 'completed' })
+      expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
+      first({ action: 'paymentOrder', phase: 'awaitingSignature' })
       if (recovery === 'resume') {
         actor.send({ type: 'SUSPEND' })
       } else {
@@ -414,15 +422,22 @@ describe('registrationMachine Shed progress ownership', () => {
       if (recovery === 'resume') resume()
       else actor.send({ type: 'RETRY' })
       await waitFor(actor, (snapshot) => snapshot.matches(state))
-      first({ action: 'tokenPermit', phase: 'completed' })
+      first({ action: 'tokenPermit', phase: 'awaitingConfirmation' })
       expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
-      callbacks[1]?.({ action: 'paymentOrder', phase: 'awaitingSignature' })
+      const second = callbacks[1]
+      assert(second)
+      second({ action: 'paymentOrder', phase: 'awaitingSignature' })
       expect(actor.getSnapshot().context.walletProgress).toEqual({
-        current: { action: 'paymentOrder', phase: 'awaitingSignature' },
-        completed: [],
+        action: 'paymentOrder',
+        phase: 'awaitingSignature',
+      })
+      first({ action: 'tokenPermit', phase: 'awaitingSignature' })
+      expect(actor.getSnapshot().context.walletProgress).toEqual({
+        action: 'paymentOrder',
+        phase: 'awaitingSignature',
       })
       actor.send({ type: 'CANCEL' })
-      callbacks[1]?.({ action: 'paymentOrder', phase: 'completed' })
+      second({ action: 'paymentOrder', phase: 'awaitingSignature' })
       expect(actor.getSnapshot().context.walletProgress).toBeUndefined()
       actor.stop()
     },

@@ -1,4 +1,4 @@
-import { useLingui } from '@lingui/react/macro'
+import { Trans, useLingui } from '@lingui/react/macro'
 import { useBlocker } from '@tanstack/react-router'
 import { useEffect } from 'react'
 import { match, P } from 'ts-pattern'
@@ -6,7 +6,7 @@ import { useCountdown } from '@/hooks/useCountdown'
 import type { RegistrationStage } from '../../state/registration.stages'
 import { RegisterV2Context } from '../../state/registrationUi.context'
 import { useRegisteringStage } from '../../state/registrationUi.selectors'
-import { CowShedProgress } from '../shared/CowShedProgress'
+import { CowShedRecoveryLink } from '../shared/CowShedRecoveryLink'
 import { CenteredWeaveLoader } from './components/CenteredWeaveLoader'
 import { NotificationSettings } from './components/NotificationSettings'
 import { PrimaryNameSetupNotice } from './components/PrimaryNameSetupNotice'
@@ -145,11 +145,15 @@ export const RegisteringStep = ({
   const uiStage = useRegisteringStage(uiActor)
   const { stageDescription, stageLabel, cowShedProgress, childMachineState } =
     useRegisteringDisplay()
-  const progressTracker = cowShedProgress ? (
-    <CowShedProgress
-      machineState={childMachineState}
-      progress={cowShedProgress}
-    />
+  const recoveryLink = cowShedProgress ? (
+    <div className="space-y-3">
+      {childMachineState === 'runningCowShedRegistration' && (
+        <p className="text-ens-gray text-sm">
+          <Trans>Estimated time: about 1 min 30 sec</Trans>
+        </p>
+      )}
+      <CowShedRecoveryLink progress={cowShedProgress} />
+    </div>
   ) : null
 
   const notificationsCompleted = uiStage?.notifications === 'completed'
@@ -216,9 +220,9 @@ export const RegisteringStep = ({
           name={fullName}
           progress={fillProgress}
         />
-        {progressTracker && (
+        {recoveryLink && (
           <div className="mx-auto w-full max-w-2xl px-4 pb-4">
-            {progressTracker}
+            {recoveryLink}
           </div>
         )}
       </div>
@@ -241,7 +245,7 @@ export const RegisteringStep = ({
         )}
       </div>
       <div className="mx-auto w-full-[32px] max-w-6xl space-y-6.5">
-        {progressTracker}
+        {recoveryLink}
         {match(uiStage)
           .with({ notifications: 'settings' }, () => (
             <NotificationSettings

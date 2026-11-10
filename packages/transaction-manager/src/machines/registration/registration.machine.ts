@@ -71,11 +71,7 @@ import {
   type PersistedRegistrationContext,
 } from './registration.persistence'
 
-import {
-  type RegistrationWalletProgress,
-  reduceWalletProgress,
-  type WalletProgress,
-} from './registration.wallet-progress'
+import type { WalletProgress } from './registration.wallet-progress'
 
 /** `Math.max` for bigints (no bigint overload on `Math.max`). */
 const bigintMax = (a: bigint, b: bigint): bigint => (a > b ? a : b)
@@ -386,7 +382,7 @@ export type RegistrationContext = {
    * to the HCA. Persisted, so a resumed run keeps the same funding route.
    */
   ethFunding?: EthFunding
-  readonly walletProgress?: RegistrationWalletProgress
+  readonly walletProgress?: WalletProgress
   readonly walletProgressInvocation?: number
   readonly cowShedRun?: CowShedProgress
   readonly persistCowShedProgress?: (progress: CowShedProgress) => Promise<void>
@@ -1057,10 +1053,8 @@ export const registrationMachine = setup({
       event.type === 'WALLET_PROGRESS' &&
       event.invocation === context.walletProgressInvocation
         ? {
-            walletProgress: reduceWalletProgress(
-              context.walletProgress,
-              event.progress,
-            ),
+            walletProgress:
+              event.progress.phase === 'completed' ? undefined : event.progress,
           }
         : {},
     ),

@@ -43,7 +43,6 @@ import {
   submitPrimaryNameForward,
   submitPrimaryNameReverse,
 } from '../../profile/service/setPrimaryName'
-import { saveCowShedRecovery } from '../service/cowShedRecovery'
 import { getL2FundingSource } from '../service/l2FundingSource'
 import { readPendingEthSwap } from '../service/pendingEthSwap'
 import { readPendingL2Bridge } from '../service/pendingL2Bridge'
@@ -369,7 +368,6 @@ const createCowShedProgressWriter =
       { ...snapshot.context, cowShedRun: progress },
       Date.now(),
     )
-    saveCowShedRecovery(record)
     await createRegistrationPersistenceAdapter({
       label,
       getAppState: () => appState,

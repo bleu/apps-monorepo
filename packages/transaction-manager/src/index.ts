@@ -136,7 +136,6 @@ export type {
   RegistrationMachineState,
 } from './machines/registration/registration.types'
 export type {
-  RegistrationWalletProgress,
   WalletAction,
   WalletProgress,
 } from './machines/registration/registration.wallet-progress'

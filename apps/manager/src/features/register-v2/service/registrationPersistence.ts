@@ -11,10 +11,8 @@
  * registers `bob` has made their choice, and carrying two records would mean
  * two commitments to reconcile on every mount.
  *
- * Storage is best-effort throughout. A private-mode browser or a full quota
- * costs the user resume, not the registration — every failure degrades to "no
- * stored record" rather than throwing. (Contrast `migrationBatchJournal.ts`,
- * which DOES throw: there, losing the journal risks a double-submit.)
+ * Ordinary saves are best-effort. Shed checkpoints require durable storage
+ * before outward submission because losing signed progress risks a double-submit.
  */
 
 import type {
@@ -286,6 +284,20 @@ export function isFailedRegistrationRecord(
   return record.stage === 'error'
 }
 
+function saveRegistrationEnvelope(
+  storage: StorageLike,
+  envelope: StoredRegistrationEnvelope,
+  requireDurableSave: boolean,
+): void {
+  const serialized = JSON.stringify(envelope)
+  storage.setItem(REGISTRATION_RESUME_STORAGE_KEY, serialized)
+  if (
+    requireDurableSave &&
+    storage.getItem(REGISTRATION_RESUME_STORAGE_KEY) !== serialized
+  )
+    throw new Error('Registration recovery data was not saved')
+}
+
 /**
  * Build the adapter that `subscribeRegistrationPersistence` writes through.
  *
@@ -330,9 +342,10 @@ export function createRegistrationPersistenceAdapter(options: {
       }
 
       try {
-        storage.setItem(
-          REGISTRATION_RESUME_STORAGE_KEY,
-          JSON.stringify(envelope),
+        saveRegistrationEnvelope(
+          storage,
+          envelope,
+          options.requireDurableSave === true,
         )
       } catch (cause) {
         if (options.requireDurableSave) throw cause

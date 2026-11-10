@@ -96,12 +96,14 @@ describe('FailureStep', () => {
       })
 
       expect(
-        screen.getByRole('list', { name: 'Registration progress' }),
-      ).toBeVisible()
+        screen.queryByRole('list', { name: 'Registration progress' }),
+      ).not.toBeInTheDocument()
       expect(screen.queryByText(/Shed address:/)).not.toBeInTheDocument()
-      expect(screen.getByText(/No payment was submitted/)).toHaveTextContent(
-        /Signed hooks may still execute/,
-      )
+      expect(
+        screen.getByText(
+          'No payment was submitted. Signed hooks may still execute. Going back does not cancel them. Do not add funds to the Shed.',
+        ),
+      ).toBeVisible()
       expect(screen.getByRole('button', { name: 'Try Again' })).toBeEnabled()
       fireEvent.click(screen.getByRole('button', { name: 'Back to Quote' }))
       expect(send).toHaveBeenCalledWith({ type: 'cancel' })
@@ -120,8 +122,8 @@ describe('FailureStep', () => {
       const { send } = renderFailure({ [source]: { stage, plan } })
 
       expect(
-        screen.getByRole('list', { name: 'Registration progress' }),
-      ).toHaveTextContent('Needs attention')
+        screen.queryByRole('list', { name: 'Registration progress' }),
+      ).not.toBeInTheDocument()
       expect(
         screen.getByRole('link', { name: 'Recover funds in CoW Swap' }),
       ).toHaveAttribute(
@@ -129,7 +131,11 @@ describe('FailureStep', () => {
         `https://swap.cow.fi/#/11155111/account-proxy/${plan.signed.cowShedAccount}`,
       )
       expect(
-        screen.getByText(/Signed orders or hooks may still execute/),
+        screen.getByText(
+          stage === 'fundingSubmission'
+            ? 'Payment submission is uncertain. Signed orders or hooks may still execute. Going back does not cancel them. Do not add funds to the Shed.'
+            : 'Signed orders or hooks may still execute. Going back does not cancel them. Do not add funds to the Shed.',
+        ),
       ).toBeVisible()
       expect(
         screen.queryByText(/No payment was submitted/),
@@ -155,6 +161,68 @@ describe('FailureStep', () => {
 })
 
 describe('FailureStepView', () => {
+  it.each([1, 11155111, 999999])(
+    'uses only supported saved chain %s for recovery',
+    async (chainId) => {
+      const plan = await makePlan()
+      renderView({
+        cowShedProgress: {
+          stage: 'funded',
+          plan: {
+            ...plan,
+            authorization: { ...plan.authorization, chainId },
+          },
+        },
+      })
+      const link = screen.queryByRole('link', {
+        name: 'Recover funds in CoW Swap',
+      })
+      if (chainId === 999999) {
+        expect(link).not.toBeInTheDocument()
+      } else {
+        expect(link).toHaveAttribute(
+          'href',
+          `https://swap.cow.fi/#/${chainId}/account-proxy/${plan.signed.cowShedAccount}`,
+        )
+        expect(link).toHaveAttribute('target', '_blank')
+        expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+      }
+      expect(
+        screen.getByText(
+          'Signed orders or hooks may still execute. Going back does not cancel them. Do not add funds to the Shed.',
+        ),
+      ).toBeVisible()
+      expect(
+        screen.getByText(
+          'Registration stopped. Try Again will continue from the saved progress.',
+        ),
+      ).toBeVisible()
+      expect(screen.getByText('Registration Failed')).toBeVisible()
+    },
+  )
+
+  it('keeps an expired commitment recovery-only', async () => {
+    const plan = await makePlan()
+    renderView({
+      isRecoveryOnly: true,
+      cowShedProgress: { stage: 'settled', plan },
+    })
+    expect(screen.getByText('Registration authorization expired')).toBeVisible()
+    expect(
+      screen.getByText(
+        'This commitment expired. This attempt cannot continue. Use CoW Swap to recover any remaining funds.',
+      ),
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Try Again' }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('link', { name: 'Recover funds in CoW Swap' }),
+    ).toHaveAttribute(
+      'href',
+      `https://swap.cow.fi/#/11155111/account-proxy/${plan.signed.cowShedAccount}`,
+    )
+  })
   // The refusal used to read as a failed registration, with Try Again as the
   // main action, when nothing had run and the fix is in the other tab.
   it('presents a wallet held elsewhere as a wait, not a failure', async () => {
@@ -166,8 +234,9 @@ describe('FailureStepView', () => {
     })
 
     expect(
-      screen.queryByRole('list', { name: 'Registration progress' }),
+      screen.queryByRole('link', { name: 'Recover funds in CoW Swap' }),
     ).not.toBeInTheDocument()
+    expect(screen.queryByText(/Do not add funds/)).not.toBeInTheDocument()
     expect(screen.getByText('Another Registration Is Running')).toBeVisible()
     expect(screen.queryByText('Registration Failed')).not.toBeInTheDocument()
     expect(
@@ -207,7 +276,7 @@ describe('FailureStepView', () => {
     expect(onFindAnotherName).toHaveBeenCalledOnce()
   })
 
-  it('keeps linked Shed and order references after a lost name', async () => {
+  it('keeps the Account Proxy link after a lost name without order history', async () => {
     const plan = await makePlan()
     renderView({
       nameUnavailable: true,
@@ -231,17 +300,11 @@ describe('FailureStepView', () => {
       `https://swap.cow.fi/#/11155111/account-proxy/${plan.signed.cowShedAccount}`,
     )
     expect(
-      screen.getByRole('link', { name: 'View payment order' }),
-    ).toHaveAttribute(
-      'href',
-      'https://dev.explorer.cow.fi/sepolia/orders/first-order?tab=overview',
-    )
+      screen.queryByRole('link', { name: 'View payment order' }),
+    ).not.toBeInTheDocument()
     expect(
-      screen.getByRole('link', { name: 'View registration order' }),
-    ).toHaveAttribute(
-      'href',
-      'https://dev.explorer.cow.fi/sepolia/orders/second-order?tab=overview',
-    )
+      screen.queryByRole('link', { name: 'View registration order' }),
+    ).not.toBeInTheDocument()
     expect(
       screen.queryByText(/Shed address:|Funding order:|Registration order:/),
     ).not.toBeInTheDocument()
@@ -261,14 +324,14 @@ describe('FailureStepView', () => {
     expect(retry).toHaveBeenCalledOnce()
     expect(send).not.toHaveBeenCalledWith({ type: 'retry' })
     expect(screen.getByText('Registration confirmation failed')).toBeVisible()
-    expect(screen.getAllByText('Completed')).toHaveLength(3)
-    expect(screen.getByText('Needs attention')).toBeVisible()
     expect(
-      screen.getByRole('link', { name: 'View registration order' }),
-    ).toHaveAttribute(
-      'href',
-      'https://dev.explorer.cow.fi/sepolia/orders/settled-order?tab=overview',
-    )
+      screen.getByText(
+        'The order settled, but registration could not be confirmed. Try Again will check registration without making a new payment.',
+      ),
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('list', { name: 'Registration progress' }),
+    ).not.toBeInTheDocument()
   })
 
   it('still reports a real failure as one', () => {

@@ -8,8 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { RegisterV2Context } from '../../state/registrationUi.context'
 
-import { CowShedProgress as CowShedProgressTracker } from '../shared/CowShedProgress'
-import { getCowShedProgressView } from '../shared/CowShedProgress.view'
+import { CowShedRecoveryLink } from '../shared/CowShedRecoveryLink'
 
 export const FailureStep = () => {
   const { uiActor, label, resume } = RegisterV2Context.use()
@@ -96,10 +95,7 @@ export const FailureStepView = ({
 }: FailureStepViewProps) => {
   const { t } = useLingui()
   const progress = isWalletBusy ? undefined : cowShedProgress
-  const isConfirmationFailure = progress
-    ? getCowShedProgressView({ progress, machineState: 'error' })
-        .isConfirmationFailure
-    : false
+  const isConfirmationFailure = progress?.stage === 'settled'
 
   return (
     <div className="mx-auto mt-12 mb-4 w-full-[32px] max-w-6xl space-y-6.5">
@@ -156,7 +152,7 @@ export const FailureStepView = ({
             .with(
               { progress: P.not(P.nullish) },
               () =>
-                t`Registration stopped at the step shown below. Try Again will continue from the saved progress.`,
+                t`Registration stopped. Try Again will continue from the saved progress.`,
             )
             .with({ message: P.string.minLength(1) }, ({ message }) => message)
             .otherwise(
@@ -166,9 +162,7 @@ export const FailureStepView = ({
         </AlertDescription>
       </Alert>
 
-      {progress && (
-        <CowShedProgressTracker machineState="error" progress={progress} />
-      )}
+      {progress && <CowShedRecoveryLink isFailed progress={progress} />}
       {progress && message && !nameUnavailable && (
         <details className="min-w-0 text-ens-gray text-sm">
           <summary className="cursor-pointer rounded-sm focus-visible:outline-2">
