@@ -6,6 +6,7 @@ import {
 import type { Address, Hash, Hex, PublicClient } from 'viem'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RegistrationConfirmedData } from '../state/registrationUi.machine'
+import { makePlan } from '../workflow/shared/CowShedProgress.test-utils'
 import {
   assessResumableRegistration,
   isResumeOwner,
@@ -122,6 +123,62 @@ describe('assessResumableRegistration', () => {
       value: { basePrice: 4_000_000n, premium: 1_000_000n },
     })
   })
+
+  it('keeps a signed Shed price when the live premium has changed', async () => {
+    const stored = storedRegistration({ signerType: 'eoa' })
+    const plan = await makePlan()
+    getRegisterPrice.mockResolvedValue({
+      isErr: () => false,
+      value: { basePrice: 1_000_000n, premium: 0n },
+    })
+
+    const result = await assess({
+      stored: {
+        ...stored,
+        record: {
+          ...stored.record,
+          context: {
+            ...stored.record.context,
+            cowShedRun: { stage: 'funded', plan },
+          },
+        },
+      },
+    })
+
+    expect(result.status).toBe('resumable')
+    if (result.status !== 'resumable') throw new Error(result.status)
+    expect(result.confirmedData.totalPrice).toBe(
+      plan.authorization.registrationPrice,
+    )
+    expect(getRegisterPrice).not.toHaveBeenCalled()
+  })
+
+  it.each(['runningCowShedRegistration', 'error'])(
+    'keeps an expired Shed attempt in recovery only from %s',
+    async (stage) => {
+      const stored = storedRegistration({ signerType: 'eoa', stage })
+      const plan = await makePlan()
+      const result = await assess({
+        stored: {
+          ...stored,
+          record: {
+            ...stored.record,
+            context: {
+              ...stored.record.context,
+              cowShedRun: { stage: 'funded', plan },
+            },
+          },
+        },
+        publicClient: publicClientWith(NOW - MAX_COMMITMENT_AGE),
+      })
+
+      expect(result).toMatchObject({
+        status: 'recovery-only',
+        reason: 'commitment-expired',
+      })
+      expect(getRegisterPrice).not.toHaveBeenCalled()
+    },
+  )
 
   it('re-quotes through the shared pricing query when a client is available', async () => {
     // Deduped against the pricing screen's query rather than a second raw

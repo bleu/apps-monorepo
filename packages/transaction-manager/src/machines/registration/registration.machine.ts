@@ -5,7 +5,14 @@ import {
 import { normalizeReferrer } from '@ens-apps/utils/referrer'
 import { getChainClock } from '@ens-apps/utils/time-travel/installChainClock'
 import { fromResultAsync } from '@ens-apps/utils/xstate/neverthrow'
-import type { Address, Hash, Hex, PublicClient } from 'viem'
+import { errAsync } from 'neverthrow'
+import {
+  type Address,
+  bytesToHex,
+  type Hash,
+  type Hex,
+  type PublicClient,
+} from 'viem'
 import { assign, fromPromise, setup } from 'xstate'
 import {
   isUserRejectionError,
@@ -34,6 +41,11 @@ import {
   verifyRegistrationActor,
 } from './registration.actors'
 import {
+  type CowShedProgress,
+  runCowShedRegistrationActor,
+} from './registration.cow-shed.actors'
+import { verifyCowShedRegistrationActor } from './registration.cow-shed.verification'
+import {
   type EthFunding,
   type PendingEthSwap,
   swapEthForUsdcActor,
@@ -58,6 +70,8 @@ import {
   getResumeTarget,
   type PersistedRegistrationContext,
 } from './registration.persistence'
+
+import type { WalletProgress } from './registration.wallet-progress'
 
 /** `Math.max` for bigints (no bigint overload on `Math.max`). */
 const bigintMax = (a: bigint, b: bigint): bigint => (a > b ? a : b)
@@ -368,6 +382,10 @@ export type RegistrationContext = {
    * to the HCA. Persisted, so a resumed run keeps the same funding route.
    */
   ethFunding?: EthFunding
+  readonly walletProgress?: WalletProgress
+  readonly walletProgressInvocation?: number
+  readonly cowShedRun?: CowShedProgress
+  readonly persistCowShedProgress?: (progress: CowShedProgress) => Promise<void>
   /**
    * The EthFlow order, from on-chain creation until CoW settlement.
    * Persisted, so a resumed run waits for it instead of funding twice.
@@ -456,6 +474,7 @@ export type RegistrationContext = {
     | 'submittingSetupBundle'
     | 'preparingCommitment'
     | 'signingFundingPermit'
+    | 'runningCowShedRegistration'
     | 'signingCowRegistrarPermit'
     | 'swappingEth'
     | 'approvingToken'
@@ -508,6 +527,9 @@ export type RegistrationEvent =
       displayedL2Charge?: bigint
       /** Standalone-HCA: fund with ETH. See `RegistrationContext.ethFunding`. */
       ethFunding?: EthFunding
+      readonly persistCowShedProgress?: (
+        progress: CowShedProgress,
+      ) => Promise<void>
       /** An EthFlow order an abandoned run sent; this run waits for it. */
       pendingEthSwap?: PendingEthSwap
       /**
@@ -570,6 +592,9 @@ export type RegistrationEvent =
         ) => Promise<string | null>
         /** See `RegistrationContext.reauthorizeSession`. */
         reauthorizeSession?: ReauthorizeSession
+        readonly persistCowShedProgress?: (
+          progress: CowShedProgress,
+        ) => Promise<void>
       }
     }
   | {
@@ -592,6 +617,12 @@ export type RegistrationEvent =
       /** The wallet created the EthFlow order; see `pendingEthSwap`. */
       type: 'ETH_SWAP_SENT'
       swap: PendingEthSwap
+    }
+  | { readonly type: 'COW_SHED_PROGRESS'; readonly progress: CowShedProgress }
+  | {
+      readonly type: 'WALLET_PROGRESS'
+      readonly progress: WalletProgress
+      readonly invocation: number
     }
   | { type: 'RETRY' }
   | { type: 'CANCEL' }
@@ -657,6 +688,7 @@ export const registrationMachine = setup({
         publicClient: PublicClient
         chainId: number
         bounds?: PermitValueBounds
+        fundingSource?: 'cow-settlement'
       }) => {
         return signFundingPermitActor(input)
       },
@@ -685,6 +717,66 @@ export const registrationMachine = setup({
         },
         { signal }: { signal: AbortSignal },
       ) => awaitL2BridgeActor({ ...input, signal }),
+    ),
+    runCowShedRegistration: fromResultAsync(
+      (
+        input: {
+          context: RegistrationContext
+          onProgress: (progress: CowShedProgress) => Promise<void>
+          readonly onWalletProgress?: (progress: WalletProgress) => void
+        },
+        { signal }: { signal: AbortSignal },
+      ) => {
+        const { context } = input
+        const quote = context.ethFunding?.cowShed
+        const owner = context.ownerAddress ?? context.accountAddress
+        const maximumSell = context.ethFunding?.displayedCharge
+        const sellToken = context.ethFunding?.sellToken
+        if (
+          context.signer?.type !== 'eoa' ||
+          context.chainId !== 11155111 ||
+          !context.publicClient ||
+          !context.commitment ||
+          !context.resolverAddress ||
+          !owner ||
+          !quote ||
+          maximumSell === undefined ||
+          !sellToken ||
+          !context.persistCowShedProgress
+        )
+          return errAsync(
+            new Error(
+              'The Shed payment needs a saved checkout quote and durable storage.',
+            ),
+          )
+        const saved = context.cowShedRun?.plan.authorization
+        const randomHash = () =>
+          bytesToHex(crypto.getRandomValues(new Uint8Array(32)))
+        return runCowShedRegistrationActor({
+          publicClient: context.publicClient,
+          walletClient: context.signer.walletClient,
+          chainId: context.chainId,
+          owner,
+          name: context.name,
+          duration: context.duration,
+          secret: context.commitment.secret,
+          commitment: context.commitment.commitment,
+          resolver: context.resolverAddress,
+          referrer: context.referrer,
+          registrationPrice: context.tokenPrice,
+          executionBudget: quote.executionBudget,
+          firstOrderValidTo: quote.firstOrderValidTo,
+          maximumSell,
+          sellToken,
+          salt: saved?.salt ?? randomHash(),
+          setupNonce: saved?.setupNonce ?? randomHash(),
+          registrationNonce: saved?.registrationNonce ?? randomHash(),
+          progress: context.cowShedRun,
+          onProgress: input.onProgress,
+          onWalletProgress: input.onWalletProgress,
+          signal,
+        })
+      },
     ),
     swapEthForUsdc: fromResultAsync(
       (
@@ -890,7 +982,9 @@ export const registrationMachine = setup({
     verifyRegistration: fromResultAsync(
       (
         input: {
-          mode: 'eoa' | 'hca'
+          mode: 'eoa' | 'hca' | 'cowShed'
+          readonly registrarAddress?: Address
+          readonly registryAddress?: Address
           name: string
           owner: Address
           hca: Address
@@ -905,14 +999,13 @@ export const registrationMachine = setup({
           ) => Promise<string | null>
           graceWindowMs?: number
         },
-        // Both actors grace-poll for up to 30s; pass the actor's signal so
-        // CANCEL stops the poll instead of leaving it running to term.
+        // CANCEL stops verification and any CoW transport retry pause.
         { signal }: { signal: AbortSignal },
       ) => {
-        // One machine state, two deployments: the HCA path verifies against
-        // the standalone registry, the EOA path against the old deployment.
-        return input.mode === 'hca'
-          ? verifyHcaRegistrationActor({
+        // HCA verification also checks intent status and resolver ownership.
+        switch (input.mode) {
+          case 'hca':
+            return verifyHcaRegistrationActor({
               name: input.name,
               wallet: input.owner,
               hca: input.hca,
@@ -924,7 +1017,11 @@ export const registrationMachine = setup({
               graceWindowMs: input.graceWindowMs,
               signal,
             })
-          : verifyRegistrationActor({ ...input, signal })
+          case 'cowShed':
+            return verifyCowShedRegistrationActor({ ...input, signal })
+          case 'eoa':
+            return verifyRegistrationActor({ ...input, signal })
+        }
       },
     ),
   },
@@ -946,6 +1043,21 @@ export const registrationMachine = setup({
   },
 
   actions: {
+    beginWalletProgress: assign({
+      walletProgress: () => undefined,
+      walletProgressInvocation: ({ context }) =>
+        (context.walletProgressInvocation ?? 0) + 1,
+    }),
+    clearWalletProgress: assign({ walletProgress: () => undefined }),
+    applyWalletProgress: assign(({ context, event }) =>
+      event.type === 'WALLET_PROGRESS' &&
+      event.invocation === context.walletProgressInvocation
+        ? {
+            walletProgress:
+              event.progress.phase === 'completed' ? undefined : event.progress,
+          }
+        : {},
+    ),
     logTransition: ({ context, event }) => {
       console.log('🔧 [REGISTRATION] State transition:', {
         event: event?.type,
@@ -982,6 +1094,7 @@ export const registrationMachine = setup({
       return {
         ...context,
         ...restored,
+        walletProgress: undefined,
         referrer: normalizeReferrer(restored.referrer),
         signer: event.deps.signer,
         approvalSigner: event.deps.approvalSigner,
@@ -995,6 +1108,7 @@ export const registrationMachine = setup({
         priorL2BridgeTx: carryPriorL2BridgeTx(context),
         fetchRegistrationIntentStatus: event.deps.fetchIntentStatus,
         reauthorizeSession: event.deps.reauthorizeSession,
+        persistCowShedProgress: event.deps.persistCowShedProgress,
         sessionReauthTarget: undefined,
         requiredGasOverhead: undefined,
         sessionReauthorizations: undefined,
@@ -1151,6 +1265,7 @@ export const registrationMachine = setup({
             assign(({ event }) => ({
               fetchRegistrationIntentStatus: event.fetchIntentStatus,
               reauthorizeSession: event.reauthorizeSession,
+              persistCowShedProgress: event.persistCowShedProgress,
             })),
             assign({
               name: ({ event }) => event.name,
@@ -1187,6 +1302,7 @@ export const registrationMachine = setup({
               hcaBalanceFloor: () => undefined,
               displayedL2Charge: ({ event }) => event.displayedL2Charge,
               ethFunding: ({ event }) => event.ethFunding,
+              cowShedRun: () => undefined,
               pendingEthSwap: ({ event }) => event.pendingEthSwap,
               primaryName: ({ event }) => event.primaryName,
               resolverAddress: () => undefined,
@@ -1220,6 +1336,12 @@ export const registrationMachine = setup({
         // `ResumeTarget` — no `submitting*` and no `signingFundingPermit`, so
         // a resume can never re-send a request that may already be in flight.
         RESUME: [
+          {
+            guard: ({ event }) =>
+              getResumeTarget(event) === 'runningCowShedRegistration',
+            target: 'runningCowShedRegistration',
+            actions: 'applyResumeContext',
+          },
           {
             guard: ({ event }) =>
               getResumeTarget(event) === 'verifyingRegistration',
@@ -1709,6 +1831,7 @@ export const registrationMachine = setup({
           // decays). Keep registrar consent exact; sell-token slippage is
           // bounded separately by the CoW order's maximumSell.
           value: context.tokenPrice,
+          fundingSource: 'cow-settlement' as const,
           // biome-ignore lint/style/noNonNullAssertion: guaranteed by flow
           approvalSigner: context.approvalSigner ?? context.signer!,
           // biome-ignore lint/style/noNonNullAssertion: guaranteed by flow
@@ -1732,10 +1855,55 @@ export const registrationMachine = setup({
       on: { CANCEL: 'idle' },
     },
 
+    runningCowShedRegistration: {
+      exit: 'clearWalletProgress',
+      entry: ['logTransition', 'beginWalletProgress'],
+      invoke: {
+        src: 'runCowShedRegistration',
+        input: ({ context, self }) => ({
+          context,
+          onWalletProgress: (progress: WalletProgress) =>
+            self.send({
+              type: 'WALLET_PROGRESS',
+              progress,
+              invocation: context.walletProgressInvocation ?? 0,
+            }),
+          onProgress: async (progress: CowShedProgress) => {
+            if (!context.persistCowShedProgress) return
+            await context.persistCowShedProgress(progress)
+            const current = self.getSnapshot()
+            if (
+              current.matches('runningCowShedRegistration') &&
+              current.context.walletProgressInvocation ===
+                context.walletProgressInvocation
+            ) {
+              self.send({ type: 'COW_SHED_PROGRESS', progress })
+            }
+          },
+        }),
+        onDone: { target: 'verifyingRegistration' },
+        onError: {
+          target: 'error',
+          actions: assign({
+            error: ({ event }) => event.error as Error,
+            retryTarget: () => 'runningCowShedRegistration' as const,
+          }),
+        },
+      },
+      on: {
+        WALLET_PROGRESS: { actions: 'applyWalletProgress' },
+        COW_SHED_PROGRESS: {
+          actions: assign({ cowShedRun: ({ event }) => event.progress }),
+        },
+        CANCEL: { target: 'idle', actions: assign({ suspended: () => true }) },
+      },
+    },
+
     // Paid with another token: CoW solvers send the exact USDC shortfall to
     // the HCA, or to the EOA before the normal ENS registration spine.
     swappingEth: {
-      entry: ['logTransition'],
+      entry: ['logTransition', 'beginWalletProgress'],
+      exit: 'clearWalletProgress',
       invoke: {
         src: 'swapEthForUsdc',
         input: ({ context, self }) => {
@@ -1776,6 +1944,12 @@ export const registrationMachine = setup({
               context.signer?.type === 'eoa'
                 ? context.commitment?.commitment
                 : undefined,
+            onWalletProgress: (progress: WalletProgress) =>
+              self.send({
+                type: 'WALLET_PROGRESS',
+                progress,
+                invocation: context.walletProgressInvocation ?? 0,
+              }),
             onSwapSent: (swap: PendingEthSwap) =>
               self.send({ type: 'ETH_SWAP_SENT', swap }),
           }
@@ -1807,6 +1981,7 @@ export const registrationMachine = setup({
         },
       },
       on: {
+        WALLET_PROGRESS: { actions: 'applyWalletProgress' },
         CANCEL: 'idle',
       },
     },
@@ -2033,6 +2208,13 @@ export const registrationMachine = setup({
           }
         },
         onDone: [
+          {
+            guard: ({ context }) =>
+              context.signer?.type === 'eoa' &&
+              context.ethFunding?.cowShed !== undefined,
+            target: 'runningCowShedRegistration',
+            actions: assign({ commitment: ({ event }) => event.output }),
+          },
           {
             // CoW can execute the ENS commit after settlement, but the order
             // must bind the already-generated commitment in its app-data.
@@ -2859,7 +3041,9 @@ export const registrationMachine = setup({
           mode:
             context.signer?.type === 'rhinestone'
               ? ('hca' as const)
-              : ('eoa' as const),
+              : context.signer?.type === 'eoa' && context.ethFunding?.cowShed
+                ? ('cowShed' as const)
+                : ('eoa' as const),
           name: context.name,
           // biome-ignore lint/style/noNonNullAssertion: value guaranteed by machine state
           owner: context.ownerAddress ?? context.accountAddress!,
@@ -2873,6 +3057,14 @@ export const registrationMachine = setup({
           commitment: context.commitment!.commitment,
           duration: context.duration,
           intentId: context.registrationIntentId,
+          ...(context.signer?.type === 'eoa' && context.chainId === 11155111
+            ? {
+                registrarAddress: getDestinationContracts(context.chainId)
+                  .ethRegistrar,
+                registryAddress: getDestinationContracts(context.chainId)
+                  .ethRegistry,
+              }
+            : {}),
           // A reveal rejected at submission sent nothing, so there is nothing
           // to wait for: read once and let the result decide.
           ...(context.revealSubmitFailed
@@ -3002,6 +3194,17 @@ export const registrationMachine = setup({
       ],
       on: {
         RETRY: [
+          {
+            guard: ({ context }) =>
+              !context.nameUnavailable &&
+              (context.cowShedRun !== undefined ||
+                context.retryTarget === 'runningCowShedRegistration'),
+            target: 'runningCowShedRegistration',
+            actions: assign({
+              error: () => undefined,
+              retryTarget: () => undefined,
+            }),
+          },
           {
             // The name belongs to someone else now. Every target below would
             // resubmit a registration that cannot succeed — and the catch-all

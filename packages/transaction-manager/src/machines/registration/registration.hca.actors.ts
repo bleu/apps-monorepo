@@ -862,6 +862,8 @@ export interface SignFundingPermitInput {
   publicClient: PublicClient
   chainId: number
   bounds?: PermitValueBounds
+  /** CoW settlement delivers the permitted tokens after this permit is signed. */
+  fundingSource?: 'cow-settlement'
   /** The token permitted. Defaults to the deployment's USDC. */
   token?: PermitToken
   /** What the permit funds, for its errors. Defaults to a registration. */
@@ -1006,7 +1008,10 @@ function prepareFundingPermit(
       // larger — on Sepolia an 8.00 USDC name has run to a ~20.20 USDC budget.
       // A wallet holding between the two passes the UI and then fails
       // simulation, which is exactly the window this check closes.
-      if (walletBalance < input.value) {
+      if (
+        input.fundingSource !== 'cow-settlement' &&
+        walletBalance < input.value
+      ) {
         const amount = (value: bigint) =>
           `${formatUnits(value, token.decimals)} ${token.symbol}`
         throw new Error(

@@ -725,6 +725,29 @@ describe('signFundingPermitActor', () => {
     expect(typedData.message.nonce).toBe(7n)
   })
 
+  it('signs the registrar permit before CoW delivers USDC', async () => {
+    getEip712Domain.mockRejectedValue(new Error('execution reverted'))
+    readContract
+      .mockResolvedValueOnce(7n)
+      .mockResolvedValueOnce(0n)
+      .mockResolvedValueOnce('USDC')
+      .mockResolvedValueOnce('2')
+    signTypedData.mockResolvedValue(`0x${'11'.repeat(32)}${'22'.repeat(32)}1b`)
+
+    const result = await signFundingPermitActor({
+      wallet: WALLET,
+      hca: HCA,
+      value: 8_005_501n,
+      approvalSigner: eoaSigner(WALLET),
+      publicClient,
+      chainId: sepolia.id,
+      fundingSource: 'cow-settlement',
+    })
+
+    expect(result.isOk()).toBe(true)
+    expect(signTypedData).toHaveBeenCalledOnce()
+  })
+
   it('refuses to sign a permit the wallet cannot cover, without prompting', async () => {
     // Regression: the pricing UI gates on the registration PRICE, but the
     // permit is signed for the whole HCA budget (price + both leg costs). A

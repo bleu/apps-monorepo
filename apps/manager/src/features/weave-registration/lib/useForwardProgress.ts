@@ -27,6 +27,7 @@ export function useForwardProgress(
   nameLength: number,
   cooldownRemainingSeconds: number | null = null,
   resetGeneration = 0,
+  cowShedStage?: ForwardProgressInputs['cowShedStage'],
 ): ForwardProgress {
   const progress = useRafProgress<ForwardProgressContext>({
     advance: (inputs, current, dt) =>
@@ -37,6 +38,7 @@ export function useForwardProgress(
       isComplete,
       nameLength,
       cooldownRemainingSeconds,
+      cowShedStage,
       resetGeneration,
     },
     resetGeneration,

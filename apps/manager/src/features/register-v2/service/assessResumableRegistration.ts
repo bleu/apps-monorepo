@@ -107,6 +107,33 @@ export type ResumeAssessment =
    * commitment and fail a name the user already owns.
    */
   | ({ readonly status: 'failed' } & ContinuableRegistration)
+  | ({
+      readonly status: 'recovery-only'
+      readonly reason: 'commitment-expired'
+    } & ContinuableRegistration)
+
+const assessSignedCowShedRegistration = (
+  stored: StoredRegistration,
+  staleReason: ResumeStaleReason | null,
+): ResumeAssessment | null => {
+  const progress = stored.record.context.cowShedRun
+  if (!progress) return null
+  const continuable = {
+    stored,
+    confirmedData: {
+      ...stored.confirmedData,
+      totalPrice: progress.plan.authorization.registrationPrice,
+    },
+    priceIsStale: false,
+  }
+  if (staleReason === 'commitment-expired') {
+    return { status: 'recovery-only', reason: staleReason, ...continuable }
+  }
+  return {
+    status: isFailedRegistrationRecord(stored.record) ? 'failed' : 'resumable',
+    ...continuable,
+  }
+}
 
 /**
  * Chain time, not wall-clock: `commitmentAt` is a block timestamp, and the e2e
@@ -269,6 +296,8 @@ export async function assessResumableRegistration(params: {
     commitment: stored.record.context.commitment?.commitment,
     isFailedRun,
   })
+  const signedAssessment = assessSignedCowShedRegistration(stored, staleReason)
+  if (signedAssessment) return signedAssessment
   if (staleReason) return stale(staleReason)
 
   const requoted = await requoteConfirmedData(stored)

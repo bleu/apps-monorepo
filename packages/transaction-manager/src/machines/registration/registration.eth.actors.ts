@@ -47,12 +47,18 @@ import {
 } from '../../helpers/eth-usdc-swap'
 import type { Signer } from '../../types/signer.types'
 import type { PermitSignature } from './registration.actors'
+import type { WalletProgress } from './registration.wallet-progress'
 
 export interface EthFunding {
   /** Token the wallet sells. Missing only on snapshots from the ETH-only build. */
   readonly sellToken?: CowSellToken
   /** The most sell-token units checkout showed the order spending. */
   readonly displayedCharge?: bigint
+  /** Sepolia Shed experiment. These are the amounts and times shown at checkout. */
+  readonly cowShed?: {
+    readonly executionBudget: bigint
+    readonly firstOrderValidTo: number
+  }
 }
 
 export type EthPaymentQuote = Readonly<{
@@ -281,6 +287,7 @@ type CowSettlementInput = {
   chainId: number
   order: PendingEthSwap
   signal?: AbortSignal
+  readonly onWalletProgress?: (progress: WalletProgress) => void
 }
 
 type CowSettlementOutcome = 'fulfilled' | 'dead'
@@ -339,6 +346,7 @@ const settleCowOrder = async (
     if (receipt.status !== 'success') {
       throw paymentError('The EthFlow transaction failed on-chain.')
     }
+    input.onWalletProgress?.({ action: 'nativePayment', phase: 'completed' })
   }
   const chainId = supportedChain(input.chainId)
   if (!chainId) {
@@ -392,6 +400,7 @@ export const swapEthForUsdcActor = ResultFn(async function* (input: {
   /** HCA credits top up; EOA checkout must spend the token the user selected. */
   readonly fundingMode?: 'topUp' | 'exact'
   readonly onSwapSent?: (swap: PendingEthSwap) => void
+  readonly onWalletProgress?: (progress: WalletProgress) => void
   readonly signal?: AbortSignal
 }) {
   const wallet = walletOf(input.approvalSigner)
@@ -415,6 +424,7 @@ export const swapEthForUsdcActor = ResultFn(async function* (input: {
         chainId: chain.id,
         order: input.pendingSwap,
         signal: input.signal,
+        onWalletProgress: input.onWalletProgress,
       }),
       toError,
     )
@@ -525,6 +535,7 @@ export const swapEthForUsdcActor = ResultFn(async function* (input: {
         return consentMaximum < solventMaximum ? consentMaximum : solventMaximum
       })(),
       hooks,
+      onWalletProgress: input.onWalletProgress,
     })
     input.onSwapSent?.(submitted.order)
 
@@ -535,6 +546,7 @@ export const swapEthForUsdcActor = ResultFn(async function* (input: {
         chainId: chain.id,
         order: submitted.order,
         signal: input.signal,
+        onWalletProgress: input.onWalletProgress,
       }),
       toError,
     )

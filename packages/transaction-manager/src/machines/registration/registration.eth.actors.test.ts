@@ -209,6 +209,28 @@ describe('rejectEthSwap', () => {
 })
 
 describe('swapEthForUsdcActor', () => {
+  it.each(['success', 'reverted'] as const)(
+    'reports native payment completion only for a successful receipt: %s',
+    async (status) => {
+      const onWalletProgress = vi.fn()
+      readContract.mockResolvedValue(TARGET).mockResolvedValueOnce(0n)
+      waitForTransactionReceipt.mockImplementationOnce(async () => {
+        expect(onWalletProgress).not.toHaveBeenCalled()
+        return { status }
+      })
+      const result = await swapEthForUsdcActor(input({ onWalletProgress }))
+      expect(submitCowSwap).toHaveBeenCalledWith(
+        expect.objectContaining({ onWalletProgress }),
+      )
+      expect(result.isOk()).toBe(status === 'success')
+      expect(onWalletProgress.mock.calls.map(([progress]) => progress)).toEqual(
+        status === 'success'
+          ? [{ action: 'nativePayment', phase: 'completed' }]
+          : [],
+      )
+    },
+  )
+
   it('sends the exact HCA shortfall through CoW and reports the order', async () => {
     readContract.mockResolvedValueOnce(5_000_000n).mockResolvedValueOnce(TARGET)
     quoteCowSwap.mockReturnValueOnce(

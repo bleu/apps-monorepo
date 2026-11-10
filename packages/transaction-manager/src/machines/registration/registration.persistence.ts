@@ -8,6 +8,8 @@ import {
   PAYMENT_TOKEN_CONTRACT,
   type TOKEN_SYMBOL,
 } from './registration.actors'
+import { ENS_COMMITMENT } from './registration.cow-shed'
+import type { CowShedProgress } from './registration.cow-shed.actors'
 import type { EthFunding, PendingEthSwap } from './registration.eth.actors'
 import { hcaRegistrarAddress } from './registration.hca.actors'
 import type {
@@ -86,6 +88,7 @@ export type PersistedRegistrationContext = {
   isL2BridgeFromPriorRun?: boolean
   /** A run paying with ETH, so a resumed one keeps paying with it. */
   ethFunding?: EthFunding
+  readonly cowShedRun?: CowShedProgress
   /** The EthFlow order still settling, so a resumed run waits for it. */
   pendingEthSwap?: PendingEthSwap
 
@@ -194,6 +197,7 @@ export type ResumeTarget =
   | 'verifyingRegistration'
   | 'validatingCommitment'
   | 'swappingEth'
+  | 'runningCowShedRegistration'
   | 'settingUpRegistration'
 
 /**
@@ -210,6 +214,13 @@ export function getResumeTarget(record: {
   context: PersistedRegistrationContext
 }): ResumeTarget {
   const { stage, context } = record
+
+  if (
+    context.cowShedRun ||
+    (context.ethFunding?.cowShed && context.commitment)
+  ) {
+    return 'runningCowShedRegistration'
+  }
 
   // The register call was submitted (or was being submitted when the tab
   // closed). Never re-submit: check the chain. `verifyRegistrationActor`
@@ -266,6 +277,7 @@ export function serializeRegistrationContext(
     unsettledL2Bridge: context.unsettledL2Bridge,
     isL2BridgeFromPriorRun: context.isL2BridgeFromPriorRun,
     ethFunding: context.ethFunding,
+    cowShedRun: context.cowShedRun,
     pendingEthSwap: context.pendingEthSwap,
     resolverAddress: context.resolverAddress,
     resolverTxId: context.resolverTxId,
@@ -338,6 +350,109 @@ const hexSchema = v.custom<Hex>(
   (input) => typeof input === 'string' && /^0x[0-9a-fA-F]*$/.test(input),
 )
 
+const cowHookSchema = v.strictObject({
+  target: addressSchema,
+  callData: hexSchema,
+  gasLimit: v.number(),
+})
+const cowTokenSchema = v.strictObject({
+  address: addressSchema,
+  symbol: v.string(),
+  decimals: v.number(),
+  isNative: v.boolean(),
+})
+const cowConditionalOrderSchema = v.strictObject({
+  handler: v.literal(ENS_COMMITMENT),
+  salt: hashSchema,
+  staticInput: hexSchema,
+})
+const cowSwapSchema = v.strictObject({
+  hash: v.optional(hashSchema),
+  orderId: v.string(),
+  validTo: v.number(),
+  kind: v.picklist(['native', 'erc20']),
+  amountOut: v.optional(v.bigint()),
+})
+const cowShedPlanSchema = v.strictObject({
+  authorization: v.strictObject({
+    chainId: v.literal(11155111),
+    wallet: addressSchema,
+    resolver: addressSchema,
+    name: v.string(),
+    duration: v.bigint(),
+    referrer: v.optional(hashSchema),
+    secret: hashSchema,
+    commitment: hashSchema,
+    registrationPrice: v.bigint(),
+    executionBudget: v.bigint(),
+    firstOrderValidTo: v.bigint(),
+    secondOrderValidTo: v.bigint(),
+    salt: hashSchema,
+    setupNonce: hashSchema,
+    registrationNonce: hashSchema,
+  }),
+  signed: v.strictObject({
+    cowShedAccount: addressSchema,
+    firstOrderAmountOut: v.bigint(),
+    conditionalOrder: cowConditionalOrderSchema,
+    registrationAppData: v.strictObject({
+      appDataContent: v.string(),
+      appDataHex: hashSchema,
+    }),
+    registrationHook: cowHookSchema,
+    setupHook: cowHookSchema,
+  }),
+  sellToken: cowTokenSchema,
+  maximumSell: v.bigint(),
+  funding: v.optional(cowSwapSchema),
+})
+const cowOrderRequestSchema = v.strictObject({
+  from: addressSchema,
+  sellToken: addressSchema,
+  buyToken: addressSchema,
+  receiver: addressSchema,
+  sellAmount: v.string(),
+  buyAmount: v.string(),
+  validTo: v.number(),
+  appData: hashSchema,
+  feeAmount: v.string(),
+  kind: v.literal('sell'),
+  partiallyFillable: v.literal(false),
+  sellTokenBalance: v.literal('erc20'),
+  buyTokenBalance: v.literal('erc20'),
+  signingScheme: v.literal('eip1271'),
+  signature: hexSchema,
+})
+const cowShedProgressSchema = v.variant('stage', [
+  v.strictObject({ stage: v.literal('prepared'), plan: cowShedPlanSchema }),
+  v.strictObject({
+    stage: v.literal('fundingSubmission'),
+    plan: cowShedPlanSchema,
+  }),
+  v.strictObject({
+    stage: v.literal('fundingSent'),
+    plan: cowShedPlanSchema,
+    funding: cowSwapSchema,
+  }),
+  v.strictObject({ stage: v.literal('funded'), plan: cowShedPlanSchema }),
+  v.strictObject({
+    stage: v.literal('publishing'),
+    plan: cowShedPlanSchema,
+    request: cowOrderRequestSchema,
+    orderId: v.string(),
+  }),
+  v.strictObject({
+    stage: v.literal('revealSent'),
+    plan: cowShedPlanSchema,
+    orderId: v.string(),
+  }),
+  v.strictObject({
+    stage: v.literal('settled'),
+    plan: cowShedPlanSchema,
+    orderId: v.optional(v.string()),
+  }),
+])
+
 const persistedContextSchema = v.object({
   chainId: v.number(),
   name: v.string(),
@@ -368,6 +483,12 @@ const persistedContextSchema = v.object({
   ethFunding: v.optional(
     v.object({
       displayedCharge: v.optional(v.bigint()),
+      cowShed: v.optional(
+        v.strictObject({
+          executionBudget: v.bigint(),
+          firstOrderValidTo: v.number(),
+        }),
+      ),
       sellToken: v.optional(
         v.object({
           address: addressSchema,
@@ -377,6 +498,11 @@ const persistedContextSchema = v.object({
         }),
       ),
     }),
+  ),
+  cowShedRun: v.optional(
+    v.custom<CowShedProgress>(
+      (input) => v.safeParse(cowShedProgressSchema, input).success,
+    ),
   ),
   pendingEthSwap: v.optional(
     v.object({
@@ -491,6 +617,9 @@ const CLEARING_STAGES = new Set(['idle', 'success'])
 const isDeclinedRun = (stage: string, context: RegistrationContext) =>
   stage === 'error' && isUserRejectionError(context.error)
 
+const hasCowShedRun = (context: RegistrationContext) =>
+  Boolean(context.ethFunding?.cowShed || context.cowShedRun)
+
 /**
  * Mirror an actor's progress into `adapter`.
  *
@@ -502,7 +631,8 @@ const isDeclinedRun = (stage: string, context: RegistrationContext) =>
  * would.
  *
  * Storage failures are swallowed: a full quota must never take down a
- * registration that is otherwise fine.
+ * registration that is otherwise fine. Shed runs use their awaited progress
+ * writer instead; this subscriber only clears them after success.
  *
  * @returns an unsubscribe function
  */
@@ -539,6 +669,12 @@ export function subscribeRegistrationPersistence(
     // it, and let the next run's first write through.
     if (snapshot.context.suspended) {
       lastPayload = null
+      return
+    }
+
+    if (hasCowShedRun(snapshot.context)) {
+      // Only the awaited writer may save Shed progress; async snapshot writes can replace a newer submission checkpoint.
+      if (stage === 'success') runSafely(() => adapter.clear())
       return
     }
 

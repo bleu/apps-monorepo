@@ -16,6 +16,59 @@ const makeInputs = (
 })
 
 describe('advanceForwardProgress', () => {
+  it('keeps a long CoW payment wait in the payment range', () => {
+    const progress = advanceForwardProgress(
+      makeInputs({
+        stageProgress: REGISTRATION_STAGE_PROGRESS.runningCowShedRegistration,
+        cowShedStage: 'fundingSent',
+      }),
+      0,
+      300,
+    )
+
+    expect(progress).toBe(30)
+  })
+
+  it('does not use the ordinary cooldown clock for a hidden CoW commitment wait', () => {
+    const progress = advanceForwardProgress(
+      makeInputs({ cowShedStage: 'funded', cooldownRemainingSeconds: 10 }),
+      30,
+      300,
+    )
+
+    expect(progress).toBe(70)
+  })
+
+  it('keeps restored progress when the saved CoW stage is older', () => {
+    const progress = advanceForwardProgress(
+      makeInputs({ cowShedStage: 'fundingSent' }),
+      65,
+      1,
+    )
+
+    expect(progress).toBe(65)
+  })
+
+  it('reserves the final fill for parent setup and success after CoW settlement', () => {
+    const settled = makeInputs({ cowShedStage: 'settled' })
+    const unverified = advanceForwardProgress(settled, 80, 300)
+    const setup = advanceForwardProgress(
+      {
+        ...settled,
+        stageProgress: REGISTRATION_STAGE_PROGRESS.settingPrimaryName,
+      },
+      unverified,
+      300,
+    )
+
+    expect(unverified).toBe(96)
+    expect(setup).toBeGreaterThan(unverified)
+    expect(setup).toBeLessThan(100)
+    expect(
+      advanceForwardProgress({ ...settled, isComplete: true }, setup, 0.1),
+    ).toBe(100)
+  })
+
   it('fills a cooldown hidden in another tab as far as visible frames would have', () => {
     const start = 20
     const frameSeconds = 0.1

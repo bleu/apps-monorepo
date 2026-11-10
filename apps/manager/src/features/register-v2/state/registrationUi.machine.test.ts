@@ -1,4 +1,5 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: focused machine tests use compact fixtures
+import type { CowShedProgress } from '@ens-apps/transaction-manager/machines/registration/registration.cow-shed.actors'
 import type { Address } from 'viem'
 import { baseSepolia } from 'viem/chains'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -16,7 +17,13 @@ type RegistrationStubEvent =
       primaryName?: string
       referrer?: `0x${string}`
       l2Funding?: { chain: { id: number } }
-      ethFunding?: { displayedCharge?: bigint }
+      ethFunding?: {
+        displayedCharge?: bigint
+        cowShed?: {
+          executionBudget: bigint
+          firstOrderValidTo: number
+        }
+      }
       pendingEthSwap?: {
         hash: `0x${string}`
         orderId: string
@@ -26,6 +33,7 @@ type RegistrationStubEvent =
   | { type: 'RESUME'; stage: string; context: any; deps: any }
   | { type: 'FORCE_SUCCESS' }
   | { type: 'FORCE_APPROVAL_SUCCESS' }
+  | { type: 'FORCE_COW_SHED_PROGRESS'; stage: CowShedProgress['stage'] }
   | { type: 'FORCE_COMMITMENT_WITHOUT_TX_ID' }
   | {
       type: 'FORCE_ERROR'
@@ -59,6 +67,7 @@ vi.mock('@ens-apps/transaction-manager', () => ({
       resolverTxId: 'tx-resolver',
       commitment: undefined as object | undefined,
       commitmentTxId: 'tx-commit' as string | undefined,
+      cowShedRun: undefined as Pick<CowShedProgress, 'stage'> | undefined,
       approvalTxId: 'tx-approve',
       registrationTxId: 'tx-register',
       registerReadyTimestamp: null as number | null,
@@ -71,7 +80,10 @@ vi.mock('@ens-apps/transaction-manager', () => ({
       /** The L2 the run was handed to pay from. */
       l2FundingChainId: undefined as number | undefined,
       /** The ETH payment the run was handed. */
-      ethFunding: undefined as { displayedCharge?: bigint } | undefined,
+      ethFunding: undefined as Extract<
+        RegistrationStubEvent,
+        { type: 'START_REGISTRATION' }
+      >['ethFunding'],
       /** The swap an abandoned run sent, as the run was handed it. */
       pendingEthSwap: undefined as
         | { hash: `0x${string}`; orderId: string; validTo: number }
@@ -89,6 +101,8 @@ vi.mock('@ens-apps/transaction-manager', () => ({
             target: 'running',
             actions: assign({
               referrer: ({ event }) => event.referrer,
+              commitmentTxId: ({ event, context }) =>
+                event.ethFunding?.cowShed ? undefined : context.commitmentTxId,
               primaryName: ({ event }) =>
                 event.type === 'START_REGISTRATION'
                   ? event.primaryName
@@ -127,7 +141,20 @@ vi.mock('@ens-apps/transaction-manager', () => ({
           },
         },
       },
+      runningCowShedRegistration: {
+        on: {
+          FORCE_COW_SHED_PROGRESS: {
+            actions: assign({
+              cowShedRun: ({ event }) => ({ stage: event.stage }),
+            }),
+          },
+        },
+      },
       running: {
+        always: {
+          guard: ({ context }) => context.ethFunding?.cowShed !== undefined,
+          target: 'runningCowShedRegistration',
+        },
         on: {
           FORCE_SUCCESS: {
             target: 'success',
@@ -223,6 +250,7 @@ vi.mock('../service/registrationFailure', async (importOriginal) => ({
 
 vi.mock('../service/registrationPersistence', () => ({
   clearStoredRegistrationIfUnchanged: vi.fn(),
+  markStoredCowShedRegistrationFailed: vi.fn(),
 }))
 
 import { waitForTransaction } from '@ens-apps/transaction-manager'
@@ -1658,6 +1686,57 @@ describe('paying with ETH', () => {
     })
     actor.stop()
   })
+
+  it('keeps the displayed Shed execution budget and signed timing when starting registration', () => {
+    const actor = startActorInTokens()
+    const cowShed = {
+      executionBudget: 250_000n,
+      firstOrderValidTo: 1_800_000_300,
+    }
+    actor.send({
+      ...startEvent(smartAccount),
+      ethFunding: { displayedCharge: 1000n, cowShed },
+    })
+
+    expect(getChild(actor).getSnapshot().context.ethFunding).toEqual({
+      displayedCharge: 1000n,
+      cowShed,
+    })
+    actor.stop()
+  })
+
+  it.each(['fundingSent', 'funded'] as const)(
+    'keeps Shed payment approval open until the first submitted stage is %s',
+    (submittedStage) => {
+      const actor = startActorInTokens()
+      actor.send({
+        ...startEvent(smartAccount),
+        ethFunding: {
+          displayedCharge: 1000n,
+          cowShed: {
+            executionBudget: 250_000n,
+            firstOrderValidTo: 1_800_000_300,
+          },
+        },
+      })
+
+      expect(
+        getChild(actor).getSnapshot().context.commitmentTxId,
+      ).toBeUndefined()
+      expect(actor.getSnapshot().matches({ pricing: 'approving' })).toBe(true)
+      for (const stage of ['prepared', 'fundingSubmission'] as const) {
+        sendToChild(actor, { type: 'FORCE_COW_SHED_PROGRESS', stage })
+        expect(actor.getSnapshot().matches({ pricing: 'approving' })).toBe(true)
+      }
+
+      sendToChild(actor, {
+        type: 'FORCE_COW_SHED_PROGRESS',
+        stage: submittedStage,
+      })
+      expect(actor.getSnapshot().matches('registering')).toBe(true)
+      actor.stop()
+    },
+  )
 
   it("hands the registration a cancelled run's ETH swap so it is not bought twice", () => {
     const swap = {

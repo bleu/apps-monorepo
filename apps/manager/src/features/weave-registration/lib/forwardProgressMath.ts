@@ -1,3 +1,4 @@
+import type { CowShedProgress } from '@ens-apps/transaction-manager'
 import { REGISTRATION_STAGE_PROGRESS } from '@/features/register-v2/state/registration.stages'
 
 const COOLDOWN_MACHINE = REGISTRATION_STAGE_PROGRESS.commitmentCooldown
@@ -20,11 +21,25 @@ const COMPLETE_MIN_SPEED = 50
 /** One frame's worth of sweep, so a sweep resumed from a hidden tab still plays. */
 const MAX_SWEEP_STEP_SEC = 0.1
 
+const COW_SHED_DISPLAY_RANGES = {
+  prepared: { start: 0, end: 10 },
+  fundingSubmission: { start: 10, end: 15 },
+  fundingSent: { start: 15, end: 30 },
+  funded: { start: 30, end: 70 },
+  publishing: { start: 70, end: 75 },
+  revealSent: { start: 75, end: 93 },
+  settled: { start: 93, end: 96 },
+} as const satisfies Record<
+  CowShedProgress['stage'],
+  Readonly<{ start: number; end: number }>
+>
+
 export interface ForwardProgressInputs {
   stageProgress: number
   isComplete: boolean
   nameLength: number
   cooldownRemainingSeconds: number | null
+  readonly cowShedStage?: CowShedProgress['stage']
 }
 
 function remapToDisplay(machineProgress: number): number {
@@ -86,7 +101,17 @@ export function advanceForwardProgress(
     MIN_SPEED_CHARS_PER_SEC * pctPerChar,
   )
 
-  if (cooldownRemainingSeconds !== null && cooldownRemainingSeconds > 0) {
+  const cowShedRange =
+    inputs.cowShedStage &&
+    stageProgress < REGISTRATION_STAGE_PROGRESS.postRegistrationSetup
+      ? COW_SHED_DISPLAY_RANGES[inputs.cowShedStage]
+      : undefined
+
+  if (
+    !inputs.cowShedStage &&
+    cooldownRemainingSeconds !== null &&
+    cooldownRemainingSeconds > 0
+  ) {
     const cap = POST_COOLDOWN_DISPLAY
     if (current >= cap) return current
     // Linear from here to the cap at the moment the cooldown ends. `dt` ago
@@ -99,10 +124,11 @@ export function advanceForwardProgress(
     return Math.min(cap, Math.max(paced, current + minSpeed * dt))
   }
 
-  const cap = displayCap(stageProgress)
-  if (current >= cap) return current
-  const speed = Math.max((cap - current) * GAP_CLOSE_FRACTION_PER_SEC, minSpeed)
-  return Math.min(cap, current + speed * dt)
+  const cap = cowShedRange?.end ?? displayCap(stageProgress)
+  const start = Math.max(current, cowShedRange?.start ?? current)
+  if (start >= cap) return start
+  const speed = Math.max((cap - start) * GAP_CLOSE_FRACTION_PER_SEC, minSpeed)
+  return Math.min(cap, start + speed * dt)
 }
 
 export function snapForwardProgress(value: number): number {

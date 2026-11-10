@@ -9,6 +9,7 @@ import { useForwardProgress } from './useForwardProgress'
 const useRegisteringTx = RegisterV2Context.createTxSelector((state) => ({
   value: state?.value ?? 'idle',
   registerReadyTimestamp: state?.context.registerReadyTimestamp ?? null,
+  cowShedStage: state?.context.cowShedRun?.stage,
 }))
 
 const useMaxProgress = RegisterV2Context.createSelector(
@@ -55,6 +56,7 @@ export function useRegistrationFillProgress(
       fullName.length,
       isCooldownActive ? cooldownSeconds : null,
       resetGeneration,
+      registeringTx.cowShedStage,
     ),
   }
 }

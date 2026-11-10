@@ -39,7 +39,7 @@ const chain = vi.hoisted(() => ({
       if (functionName === 'MAX_COMMITMENT_AGE') return 86_400n
       return new Promise(() => {})
     },
-    getBlock: async () => ({ timestamp: 1_800_000_000n }),
+    getBlock: vi.fn(async () => ({ timestamp: 1_800_000_000n })),
     request: () => new Promise(() => {}),
   },
 }))
@@ -102,6 +102,7 @@ import {
   loadStoredRegistration,
 } from '../service/registrationPersistence'
 import { FailureStep } from '../workflow/result/FailureStep'
+import { makePlan } from '../workflow/shared/CowShedProgress.test-utils'
 import {
   RegistrationV2UiProvider,
   useRegistrationV2Context,
@@ -178,6 +179,33 @@ const storeFailedRun = ({ registerSent }: { registerSent: boolean }) => {
   }).save(record)
 }
 
+const storeShedRun = async (stage: 'prepared' | 'funded') => {
+  storeFailedRun({ registerSent: false })
+  const stored = loadStoredRegistration()
+  if (!stored) throw new Error('Missing test registration')
+  const plan = await makePlan()
+  createRegistrationPersistenceAdapter({
+    label: stored.label,
+    getAppState: () => stored,
+  }).save({
+    ...stored.record,
+    stage: 'runningCowShedRegistration',
+    context: {
+      ...stored.record.context,
+      commitmentTxId: undefined,
+      cowShedRun: { stage, plan },
+      ethFunding: {
+        displayedCharge: plan.maximumSell,
+        sellToken: plan.sellToken,
+        cowShed: {
+          executionBudget: plan.authorization.executionBudget,
+          firstOrderValidTo: Number(plan.authorization.firstOrderValidTo),
+        },
+      },
+    },
+  })
+}
+
 /** Run as a second tab: same storage, its own holder id. */
 const asAnotherTab = <T,>(run: () => T): T => {
   const held = sessionStorage.getItem('ens-registration-holder')
@@ -204,10 +232,76 @@ describe('a failed registration, after a reload', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
+    chain.publicClient.getBlock.mockResolvedValue({ timestamp: 1_800_000_000n })
   })
 
   afterEach(() => {
+    vi.restoreAllMocks()
     uiActor = null
+  })
+
+  it('keeps an expired Shed attempt on a recovery-only failure screen without resuming it', async () => {
+    await storeShedRun('funded')
+    chain.publicClient.getBlock.mockResolvedValue({ timestamp: 1_800_086_400n })
+    const page = renderPage()
+
+    expect(
+      await screen.findByRole('link', { name: 'Recover funds in CoW Swap' }),
+    ).toBeVisible()
+    expect(screen.getByText('Registration authorization expired')).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Try Again' }),
+    ).not.toBeInTheDocument()
+    expect(childState()).toBe('idle')
+    expect(loadStoredRegistration()?.record.context.cowShedRun?.stage).toBe(
+      'funded',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to Quote' }))
+    expect(loadStoredRegistration()?.record.context.cowShedRun?.stage).toBe(
+      'funded',
+    )
+    page.unmount()
+  })
+
+  it('stops a restored retry when its Shed commitment expired while the failure screen was open', async () => {
+    await storeShedRun('funded')
+    const stored = loadStoredRegistration()
+    if (!stored) throw new Error('Missing test registration')
+    createRegistrationPersistenceAdapter({
+      label: stored.label,
+      getAppState: () => stored,
+    }).save({ ...stored.record, stage: 'error' })
+    const page = renderPage()
+    expect(await screen.findByText('Registration Failed')).toBeVisible()
+
+    chain.publicClient.getBlock.mockResolvedValue({ timestamp: 1_800_086_400n })
+    await tryAgain()
+
+    expect(
+      await screen.findByText('Registration authorization expired'),
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Try Again' }),
+    ).not.toBeInTheDocument()
+    expect(childState()).toBe('idle')
+    expect(loadStoredRegistration()?.record.context.cowShedRun?.stage).toBe(
+      'funded',
+    )
+    page.unmount()
+  })
+
+  it('records a Shed runner failure and does not replay it on the next mount', async () => {
+    await storeShedRun('prepared')
+    const firstPage = renderPage()
+    expect(await screen.findByText('Registration Failed')).toBeVisible()
+    expect(loadStoredRegistration()?.record.stage).toBe('error')
+    firstPage.unmount()
+
+    const secondPage = renderPage()
+    expect(await screen.findByText('Registration Failed')).toBeVisible()
+    expect(childState()).toBe('idle')
+    secondPage.unmount()
   })
 
   it('comes back on the failure screen, and Try Again continues it once the wallet is free', async () => {

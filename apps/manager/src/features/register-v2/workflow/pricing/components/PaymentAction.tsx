@@ -44,7 +44,7 @@ export const PaymentAction = ({
       <Button
         aria-busy={isSettling}
         className={cn(
-          'h-18 w-full rounded font-medium font-mono text-sm uppercase tracking-[1.12px]',
+          'wrap-anywhere h-18 w-full whitespace-normal rounded font-medium font-mono text-sm uppercase tracking-[1.12px]',
           isEnabled
             ? 'bg-ens-lapis-500 text-white hover:bg-ens-blue-hover'
             : 'bg-ens-quartz-100 text-ens-quartz-400',
@@ -52,6 +52,7 @@ export const PaymentAction = ({
         )}
         disabled={!isEnabled}
         onClick={onRetry ?? onNext}
+        type="button"
       >
         {onRetry ? <Trans>Try again</Trans> : label}
       </Button>

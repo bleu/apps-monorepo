@@ -1,4 +1,5 @@
 import '@testing-library/jest-dom'
+import { NATIVE_ETH } from '@ens-apps/transaction-manager'
 import { i18n } from '@lingui/core'
 import { I18nProvider } from '@lingui/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -11,6 +12,7 @@ import { HCA_PAYMENT_TOKEN } from '@/lib/smart-account/useSmartAccountBalances'
 
 const smartAccountMock = vi.hoisted(() => ({
   useSmartAccountContext: vi.fn(),
+  paymentAsset: 'wallet',
 }))
 
 vi.mock('@/lib/smart-account/SmartAccountContext', () => smartAccountMock)
@@ -24,13 +26,17 @@ vi.mock('@xstate/react', () => ({
     _actor: unknown,
     select: (state: {
       matches: () => boolean
-      context: { duration: number; selectedToken: string }
+      context: { duration: number; selectedToken: string; paymentAsset: string }
     }) => unknown,
   ) =>
     _actor
       ? select({
           matches: () => false,
-          context: { duration: 31_536_000, selectedToken: 'USDC' },
+          context: {
+            duration: 31_536_000,
+            selectedToken: 'USDC',
+            paymentAsset: smartAccountMock.paymentAsset,
+          },
         })
       : undefined,
 }))
@@ -64,6 +70,30 @@ vi.mock('@/features/shared/service/ownedNamesCount', () => ({
   }),
 }))
 
+vi.mock('../hooks/useCowPaymentTokens', () => ({
+  useCowPaymentTokens: () => ({
+    data: [{ ...NATIVE_ETH, balance: 10n ** 18n }],
+    isLoading: false,
+  }),
+}))
+
+vi.mock('../../../data/queries/ethPaymentQuote.query', () => ({
+  getEthPaymentQuoteQueryOptions: ({ isEnabled }: { isEnabled: boolean }) => ({
+    queryKey: ['eth-payment-quote'],
+    enabled: isEnabled,
+    queryFn: async () => ({
+      swap: { maximumSell: 165_500_000_000_000_000n },
+      walletBalance: 10n ** 18n,
+      gasReserve: 0n,
+      ethUsd: 200_000_000_000n,
+      cowShed: {
+        executionBudget: 1_000_000n,
+        firstOrderValidTo: 1_800_000_300,
+      },
+    }),
+  }),
+}))
+
 import { TokenPickerContent } from './TokenPickerContent'
 
 i18n.loadAndActivate({ locale: 'en', messages: {} })
@@ -83,6 +113,7 @@ const mockAccount = (
   overrides: Partial<{
     signer: { type: string } | null
     accountAddress: string | null
+    ownerAddress: string | null
   }> = {},
 ) =>
   smartAccountMock.useSmartAccountContext.mockReturnValue({
@@ -117,6 +148,32 @@ const renderConnectedPicker = () => {
 describe('TokenPickerContent budget quote', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    smartAccountMock.paymentAsset = 'wallet'
+  })
+
+  it('shows the EOA token-payment receipt without an HCA budget', async () => {
+    smartAccountMock.paymentAsset = 'eth'
+    mockAccount({
+      signer: { type: 'eoa' },
+      accountAddress: null,
+      ownerAddress: '0x1111111111111111111111111111111111111111',
+    })
+    renderConnectedPicker()
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('Registration total').nextElementSibling,
+      ).toHaveTextContent('$330.00')
+      expect(
+        screen.getByText('Estimated network fee').nextElementSibling,
+      ).toHaveTextContent('$1.00')
+      expect(screen.getByText('You pay').nextElementSibling).toHaveTextContent(
+        '$331.00',
+      )
+    })
+    expect(
+      screen.getByRole('region', { name: 'Payment summary' }),
+    ).toHaveAttribute('aria-busy', 'false')
   })
 
   it('blocks checkout on the HCA route when the budget query errors', async () => {

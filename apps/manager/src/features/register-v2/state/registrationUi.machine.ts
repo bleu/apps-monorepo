@@ -1,5 +1,6 @@
 import type { HcaSessionEnablePayload } from '@ens-apps/smart-account'
 import {
+  buildRegistrationRecord,
   type EthFunding,
   type L2FundingSource,
   type PersistedRegistrationRecord,
@@ -9,6 +10,7 @@ import {
   waitForTransaction,
 } from '@ens-apps/transaction-manager'
 import { isUserRejectionError } from '@ens-apps/transaction-manager/errors/transaction.errors'
+import type { CowShedProgress } from '@ens-apps/transaction-manager/machines/registration/registration.cow-shed.actors'
 import { getResumeTarget } from '@ens-apps/transaction-manager/machines/registration/registration.persistence'
 import { normalizeReferrer } from '@ens-apps/utils/referrer'
 import { $qk } from '@ens-apps/utils/tanstack-query/queryKey'
@@ -56,6 +58,9 @@ import {
 } from '../service/registrationLock'
 import {
   clearStoredRegistrationIfUnchanged,
+  createRegistrationPersistenceAdapter,
+  markStoredCowShedRegistrationFailed,
+  type RegistrationAppState,
   type StoredRegistrationKey,
 } from '../service/registrationPersistence'
 import { startSyncEthAddressRecordTransaction } from '../service/syncEthAddressRecord'
@@ -147,7 +152,10 @@ type Context = {
    * an unready account refuses lands back here with the screen still
    * restored.
    */
-  restoredRun?: StoredRegistrationKey
+  restoredRun?: StoredRegistrationKey & {
+    readonly cowShedRun?: CowShedProgress
+    readonly recoveryReason?: 'commitment-expired'
+  }
   /** A start or resume the wallet lock refused; `retry` re-raises it once free. */
   pendingStart?: Extract<
     Events,
@@ -246,7 +254,10 @@ type Events =
       type: 'registration.failure.restore'
       confirmedData: RegistrationConfirmedData
       /** The stored write the run was restored from. */
-      run: StoredRegistrationKey
+      run: StoredRegistrationKey & {
+        readonly cowShedRun?: CowShedProgress
+        readonly recoveryReason?: 'commitment-expired'
+      }
     }
   | {
       /**
@@ -285,6 +296,16 @@ const isRegistrationSnapshotEvent = (
   event: unknown,
 ): event is { snapshot: RegistrationSnapshot } =>
   !!event && typeof event === 'object' && 'snapshot' in event
+
+const hasCowShedFundingBeenSent = (
+  stage: CowShedProgress['stage'] | undefined,
+): boolean =>
+  match(stage)
+    .with(
+      P.union('fundingSent', 'funded', 'publishing', 'revealSent', 'settled'),
+      () => true,
+    )
+    .otherwise(() => false)
 
 const shouldSyncEthRecord = (context: Context) =>
   context.postRegistrationSetup?.primaryName?.syncEthRecord === true
@@ -331,6 +352,28 @@ const updateMaxProgress = (
   }
   return { stage, progress }
 }
+
+const createCowShedProgressWriter =
+  (
+    label: string,
+    getSnapshot: () => RegistrationSnapshot | undefined,
+    getAppState: () => RegistrationAppState,
+  ) =>
+  async (progress: CowShedProgress): Promise<void> => {
+    const snapshot = getSnapshot()
+    const appState = getAppState()
+    if (!snapshot) throw new Error('Registration recovery state is unavailable')
+    const record = buildRegistrationRecord(
+      'runningCowShedRegistration',
+      { ...snapshot.context, cowShedRun: progress },
+      Date.now(),
+    )
+    await createRegistrationPersistenceAdapter({
+      label,
+      getAppState: () => appState,
+      requireDurableSave: true,
+    }).save(record)
+  }
 
 const machineSetup = setup({
   types: {
@@ -761,7 +804,7 @@ const getStartFunding = (
 }
 
 const startRegistrationAction = machineSetup.createAction(
-  enqueueActions(({ enqueue, context, event }) => {
+  enqueueActions(({ enqueue, context, event, self }) => {
     if (event.type !== 'registration.start') {
       return enqueue.raise({
         type: '$error',
@@ -902,6 +945,14 @@ const startRegistrationAction = machineSetup.createAction(
         l2Funding: funding.l2Funding,
         displayedL2Charge: event.displayedL2Charge,
         ethFunding: funding.ethFunding,
+        persistCowShedProgress: createCowShedProgressWriter(
+          event.label,
+          () =>
+            self
+              .getSnapshot()
+              .children[REGISTRATION_V2_ACTOR_ID]?.getSnapshot(),
+          () => self.getSnapshot().context,
+        ),
         // A cancelled run's swap may still land: count it, don't buy twice.
         pendingEthSwap: readPendingEthSwap(context.chainId, ownerAddress),
         // A cancelled run's bridge may still arrive: wait for it, don't pay twice.
@@ -931,7 +982,7 @@ const startRegistrationAction = machineSetup.createAction(
  * run has to behave like the run it is continuing.
  */
 const resumeRegistrationAction = machineSetup.createAction(
-  enqueueActions(({ enqueue, event }) => {
+  enqueueActions(({ enqueue, event, self }) => {
     if (event.type !== 'registration.resume') {
       return enqueue.raise({
         type: '$error',
@@ -1042,6 +1093,14 @@ const resumeRegistrationAction = machineSetup.createAction(
           // persisted reveal intent is still filling or dead, instead of
           // sitting out the full grace poll before showing the retry screen.
           fetchIntentStatus: buildIntentStatusFetcher(),
+          persistCowShedProgress: createCowShedProgressWriter(
+            event.confirmedData.label,
+            () =>
+              self
+                .getSnapshot()
+                .children[REGISTRATION_V2_ACTOR_ID]?.getSnapshot(),
+            () => self.getSnapshot().context,
+          ),
           reauthorizeSession: event.account.reauthorizeSession,
         },
       } satisfies RegistrationEvent),
@@ -1065,6 +1124,9 @@ export const registrationV2UiMachine = machineSetup.createMachine({
       {
         guard: ({ event: { snapshot } }) => snapshot.matches('error'),
         actions: [
+          ({ event: { snapshot } }) => {
+            markStoredCowShedRegistrationFailed(snapshot.context)
+          },
           raise(({ event: { snapshot } }) => ({
             type: 'transaction.failed',
             message: getRegistrationFailureMessage(snapshot.context.error),
@@ -1100,7 +1162,8 @@ export const registrationV2UiMachine = machineSetup.createMachine({
         // resumed run can have a validated commitment and cooldown timestamp
         // without a local transaction ID. Both have completed upfront approval.
         guard: ({ event: { snapshot } }) =>
-          (!!snapshot.context.commitmentTxId ||
+          (hasCowShedFundingBeenSent(snapshot.context.cowShedRun?.stage) ||
+            !!snapshot.context.commitmentTxId ||
             (!!snapshot.context.commitment &&
               snapshot.context.registerReadyTimestamp != null)) &&
           !snapshot.matches('idle') &&
@@ -1526,6 +1589,10 @@ export const registrationV2UiMachine = machineSetup.createMachine({
         },
       },
       on: {
+        'registration.failure.restore': {
+          guard: 'isRestoredFailure',
+          actions: ['restoreFailure'],
+        },
         retry: [
           {
             // Nothing to forward to: the child never resumed. Try Again on a

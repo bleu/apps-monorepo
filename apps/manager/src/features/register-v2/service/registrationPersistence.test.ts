@@ -4,13 +4,15 @@ import {
   serializeRegistrationRecord,
 } from '@ens-apps/transaction-manager'
 import type { Address, Hash, Hex, PublicClient } from 'viem'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RegistrationConfirmedData } from '../state/registrationUi.machine'
+import { makePlan } from '../workflow/shared/CowShedProgress.test-utils'
 import {
   clearStoredRegistration,
   clearStoredRegistrationIfUnchanged,
   createRegistrationPersistenceAdapter,
   loadStoredRegistration,
+  markStoredCowShedRegistrationFailed,
   REGISTRATION_RESUME_VERSION,
 } from './registrationPersistence'
 
@@ -89,6 +91,44 @@ describe('registration persistence adapter', () => {
       getAppState: () => appState,
       storage,
     })
+
+  it.each(['prepared', 'fundingSubmission', 'funded', 'settled'] as const)(
+    'marks a failed Shed run without replacing its %s checkpoint',
+    async (stage) => {
+      const saved = record('runningCowShedRegistration')
+      const progress = { stage, plan: await makePlan() }
+      const checkpoint = {
+        ...saved,
+        context: { ...saved.context, cowShedRun: progress },
+      }
+      adapterFor().save(checkpoint)
+
+      markStoredCowShedRegistrationFailed(saved.context, storage)
+
+      const loaded = loadStoredRegistration(storage)
+      expect(loaded?.record.stage).toBe('error')
+      expect(loaded?.record.context.cowShedRun).toEqual(progress)
+      expect(loaded?.confirmedData).toEqual(confirmedData)
+    },
+  )
+
+  it('does not mark another attempt as failed', async () => {
+    const saved = record('runningCowShedRegistration')
+    adapterFor().save({
+      ...saved,
+      context: {
+        ...saved.context,
+        cowShedRun: { stage: 'prepared', plan: await makePlan() },
+      },
+    })
+    markStoredCowShedRegistrationFailed(
+      { ...saved.context, commitment: undefined },
+      storage,
+    )
+    expect(loadStoredRegistration(storage)?.record.stage).toBe(
+      'runningCowShedRegistration',
+    )
+  })
 
   it('round-trips the record with its confirmed pricing', () => {
     adapterFor().save(record())
@@ -255,6 +295,93 @@ describe('registration persistence adapter', () => {
     )
 
     expect(loadStoredRegistration(storage)).toBeNull()
+  })
+
+  it.each(['dropped', 'changed'] as const)(
+    'stops a Shed submission when storage leaves the envelope %s',
+    (write) => {
+      const adapter = createRegistrationPersistenceAdapter({
+        label: 'leon',
+        getAppState: () => ({ confirmedData }),
+        storage: {
+          ...storage,
+          setItem: (key, value) => {
+            if (write === 'changed') storage.setItem(key, `${value} `)
+          },
+        },
+        requireDurableSave: true,
+      })
+
+      expect(() => adapter.save(record())).toThrow('was not saved')
+    },
+  )
+
+  it('retains a durable signed Shed checkpoint in the primary envelope', async () => {
+    const checkpoint = record('runningCowShedRegistration')
+    const progress = { stage: 'prepared', plan: await makePlan() } as const
+    const saved = {
+      ...checkpoint,
+      context: { ...checkpoint.context, cowShedRun: progress },
+    }
+    const adapter = createRegistrationPersistenceAdapter({
+      label: 'leon',
+      getAppState: () => ({ confirmedData }),
+      storage,
+      requireDurableSave: true,
+    })
+
+    adapter.save(saved)
+
+    expect(loadStoredRegistration(storage)?.record).toEqual(saved)
+  })
+
+  it.each([true, false])(
+    'handles failed writes with requireDurableSave=%s',
+    (requireDurableSave) => {
+      const adapter = createRegistrationPersistenceAdapter({
+        label: 'leon',
+        getAppState: () => ({ confirmedData }),
+        storage: {
+          ...storage,
+          setItem: () => {
+            throw new Error('Storage quota exceeded')
+          },
+        },
+        requireDurableSave,
+      })
+      const save = () => adapter.save(record())
+      if (requireDurableSave) expect(save).toThrow('Storage quota exceeded')
+      else expect(save).not.toThrow()
+    },
+  )
+
+  it('does not read back ordinary best-effort saves', () => {
+    const getItem = vi.fn(storage.getItem)
+    const adapter = createRegistrationPersistenceAdapter({
+      label: 'leon',
+      getAppState: () => ({ confirmedData }),
+      storage: { ...storage, getItem },
+    })
+
+    adapter.save(record())
+
+    expect(getItem).not.toHaveBeenCalled()
+    expect(loadStoredRegistration(storage)?.confirmedData).toEqual(
+      confirmedData,
+    )
+  })
+
+  it('stops a Shed submission when durable storage is unavailable', () => {
+    const adapter = createRegistrationPersistenceAdapter({
+      label: 'leon',
+      getAppState: () => ({ confirmedData }),
+      storage: null,
+      requireDurableSave: true,
+    })
+
+    expect(() => adapter.save(record())).toThrow(
+      'Registration recovery storage is unavailable',
+    )
   })
 
   it('degrades to no-op when storage is unavailable', () => {

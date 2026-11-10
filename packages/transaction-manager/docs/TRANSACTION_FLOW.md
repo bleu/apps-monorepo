@@ -4,6 +4,8 @@
 
 This document traces the complete transaction lifecycle from user action to on-chain confirmation, showing how all components work together.
 
+The Sepolia EOA registration experiment uses two CoW orders and signed Account Proxy hooks. See [CoW Shed registration flow](../../../cow-shed-registration-flow.md) for wallet requests, settlement checks, recovery rules, and verification limits.
+
 **For detailed state-by-state documentation**, see [transactionStates/README.md](./transactionStates/README.md).
 
 ## Quick Flow Summary

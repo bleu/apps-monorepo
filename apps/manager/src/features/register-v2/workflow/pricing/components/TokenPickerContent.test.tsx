@@ -1,4 +1,5 @@
 import '@testing-library/jest-dom'
+import { NATIVE_ETH } from '@ens-apps/transaction-manager'
 import { i18n } from '@lingui/core'
 import { I18nProvider } from '@lingui/react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -1077,6 +1078,76 @@ describe('TokenPickerContentBase while a payment is in flight', () => {
   // The payment landed in the account, which now covers it all.
   const covered = { ...owed, total: 0.84, walletDebit: 0, hcaCredit: 0.84 }
 
+  it('updates the current wallet request without changing the confirmed receipt', () => {
+    const { rerender } = render(picker({ funding: owed }))
+    rerender(
+      picker({
+        funding: owed,
+        isBusy: true,
+        walletSigning: {
+          token: NATIVE_ETH,
+          progress: { action: 'registrationHook', phase: 'awaitingSignature' },
+        },
+      }),
+    )
+    expect(
+      screen.getByRole('button', { name: 'Sign registration hook' }),
+    ).toBeDisabled()
+    expect(screen.getByText(/authorize registration of the name/)).toBeVisible()
+
+    rerender(
+      picker({
+        funding: covered,
+        isBusy: true,
+        walletSigning: {
+          token: NATIVE_ETH,
+          progress: { action: 'setupHook', phase: 'awaitingSignature' },
+        },
+      }),
+    )
+    expect(
+      screen.getByRole('button', { name: 'Sign setup hook' }),
+    ).toBeDisabled()
+    expect(
+      screen.queryByRole('list', { name: 'Wallet signing progress' }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/authorize registration of the name/),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText(/authorize the name commitment/)).toBeVisible()
+    expect(receiptRow('You pay')).toHaveTextContent('$0.04')
+
+    rerender(
+      picker({
+        funding: covered,
+        isBusy: true,
+        walletSigning: {
+          token: NATIVE_ETH,
+          progress: { action: 'nativePayment', phase: 'awaitingConfirmation' },
+        },
+      }),
+    )
+    expect(
+      screen.getByRole('button', { name: 'Confirming ETH payment' }),
+    ).toBeDisabled()
+    expect(
+      screen.getByText(/Waiting for the ETH payment transaction/),
+    ).toBeVisible()
+    expect(receiptRow('You pay')).toHaveTextContent('$0.04')
+
+    rerender(picker({ funding: covered, isBusy: true }))
+    expect(
+      screen.queryByText(/Waiting for the ETH payment transaction/),
+    ).not.toBeInTheDocument()
+    expect(receiptRow('You pay')).toHaveTextContent('$0.04')
+
+    rerender(picker({ funding: owed }))
+    expect(
+      screen.queryByRole('list', { name: 'Wallet signing progress' }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Register name' })).toBeEnabled()
+  })
+
   it('keeps the figures the user confirmed until it settles', () => {
     const { rerender } = render(picker({ funding: owed }))
     rerender(picker({ funding: owed, isBusy: true }))
@@ -1148,6 +1219,39 @@ describe('TokenPickerContentBase L2 rows', () => {
       option: { ...shortRow.option, balanceRaw: 2_000_000n },
     })
   }
+
+  it('includes the Shed execution budget in the payment receipt', () => {
+    renderPicker({
+      selectedToken: 'USDC',
+      pricingData: 5,
+      registrationReceipt: { totalRaw: 5_000_000n },
+      stablecoinBalances: [usdc],
+      ethPayment: {
+        isSelected: true,
+        selectedToken: {
+          address: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+          symbol: 'ETH',
+          decimals: 18,
+          isNative: true,
+          balance: 1_000_000_000_000_000_000n,
+        },
+        row: {
+          chargeRaw: 1234567890123456n,
+          balanceRaw: 1_000_000_000_000_000_000n,
+          gasReserveRaw: 0n,
+          isQuoteLoading: false,
+          hasQuoteFailed: false,
+        },
+        cowShed: {
+          executionBudget: 250_001n,
+          firstOrderValidTo: 1_800_000_300,
+        },
+        onSelect: vi.fn(),
+        onFallbackSelect: vi.fn(),
+      },
+    })
+    expect(receiptRow('You pay')).toHaveTextContent('$5.25')
+  })
 
   it('lists an L2 that holds USDC but cannot pay, and leaves the pick to the user', () => {
     const payment = shortL2Payment()
@@ -1587,6 +1691,93 @@ describe('TokenPickerContentBase ETH row', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Pay with ETH' }))
     expect(ethPayment.onSelect).toHaveBeenCalledOnce()
     expect(screen.getByRole('button', { name: 'Register name' })).toBeDisabled()
+  })
+
+  it('keeps each wallet balance visible through token selection and quote changes', () => {
+    const eth = { ...NATIVE_ETH, balance: 10n ** 18n }
+    const dai = {
+      address: '0x00000000000000000000000000000000000000da',
+      symbol: 'DAI',
+      decimals: 18,
+      isNative: false,
+      balance: 100n * 10n ** 18n,
+    } as const
+    const tokens = [eth, dai]
+    const onSelect = vi.fn()
+    const sheet = (
+      payment: Partial<
+        NonNullable<Parameters<typeof TokenPickerContentBase>[0]['ethPayment']>
+      > = {},
+    ) => (
+      <I18nProvider i18n={i18n}>
+        <TokenPickerContentBase
+          ethPayment={{ ...ethPaymentOf(), tokens, onSelect, ...payment }}
+          funding={underfunded}
+          isConnected
+          isLoadingBalances={false}
+          label="jeff"
+          onNext={() => {}}
+          onSelectCoin={() => {}}
+          pricingData={5}
+          pricingLoading={false}
+          selectedToken="USDC"
+          showNetworkFeeDetails
+          stablecoinBalances={[usdc]}
+        />
+      </I18nProvider>
+    )
+    const { rerender } = render(sheet())
+    const ethButton = () => screen.getByRole('button', { name: 'Pay with ETH' })
+    const daiButton = () => screen.getByRole('button', { name: 'Pay with DAI' })
+    const action = () => screen.getByRole('button', { name: 'Register name' })
+    expect(screen.getByText('1 ETH')).toBeVisible()
+    expect(screen.getByText('100 DAI')).toBeVisible()
+
+    fireEvent.click(ethButton())
+    expect(onSelect).toHaveBeenLastCalledWith(eth)
+    rerender(
+      sheet({
+        isSelected: true,
+        selectedToken: eth,
+        row: ethPaymentOf({
+          balanceRaw: undefined,
+          chargeRaw: undefined,
+          isQuoteLoading: true,
+        }).row,
+      }),
+    )
+    expect(screen.getByText('1 ETH')).toBeVisible()
+    expect(action()).toBeDisabled()
+
+    fireEvent.click(daiButton())
+    expect(onSelect).toHaveBeenLastCalledWith(dai)
+    rerender(
+      sheet({
+        isSelected: true,
+        selectedToken: dai,
+        row: ethPaymentOf({ isQuoteLoading: true }).row,
+      }),
+    )
+    expect(screen.getByText('1 ETH')).toBeVisible()
+    expect(screen.getByText('100 DAI')).toBeVisible()
+    expect(action()).toBeDisabled()
+
+    const quoted = {
+      isSelected: true,
+      selectedToken: dai,
+      row: ethPaymentOf({ balanceRaw: 50n * 10n ** 18n }).row,
+    }
+    rerender(sheet(quoted))
+    expect(screen.getByText('100 DAI')).toBeVisible()
+    expect(action()).toBeEnabled()
+
+    rerender(
+      sheet({
+        ...quoted,
+        tokens: [eth, { ...dai, balance: 90n * 10n ** 18n }],
+      }),
+    )
+    expect(screen.getByText('90 DAI')).toBeVisible()
   })
 
   it('still lists token payment when the wallet has no supported stablecoin', () => {
