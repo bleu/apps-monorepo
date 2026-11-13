@@ -35,7 +35,7 @@
     "@neondatabase/serverless": "^1.2.0",
     "@react-email/components": "^1.0.12",
     "drizzle-orm": "^0.45.4",
-    "hono": "^4.13.13",
+    "hono": "^4.13.16",
     "jose": "catalog:",
     "lucide": "^0.542.0",
     "neverthrow": "^8.2.0",
